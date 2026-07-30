@@ -1,0 +1,4 @@
+trained/
+logs/
+__pycache__/
+*.pyc
