@@ -1,7 +1,7 @@
 """
 photoz_utils.py
 ===============
-Shared plotting and metrics utilities for photoz_mlp, photoz_bnn, photoz_ae.
+Shared plotting and metrics utilities for photoz_mlp, photoz_bnn, photoz_vae.
 All functions are importable; the matplotlib backend is switched to "Agg" on
 import so that plots work in headless environments.
 

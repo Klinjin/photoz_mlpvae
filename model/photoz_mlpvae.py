@@ -1,65 +1,101 @@
 """
 photoz_mlpvae.py
 ================
-2-Stage MLP-VAE: MLP z-head + 15-param VAE on a shared ResBlock trunk.
+PhotozMLPVAE: shared trunk → [z MLP head] → [SPS VAE head, conditioned on z] →
+speculator → filter_conv.
+
+This mimics photoz_vae.py's PhotozVAE (same trunk, same transforms, same
+3-term loss, same reparameterize/NLL/KL machinery) with one structural change:
+redshift is pulled out of the 16-dim joint latent into its own 1-dim latent
+with a dedicated MLP head, while the remaining 15 SPS parameters keep their
+own VAE head — sampled conditional on the redshift estimate. Everything else
+(transforms, decoder, loss shape) is copied from photoz_vae.py unchanged.
 
 Architecture
 ------------
-  Shared trunk : Linear(40→512) + BN + ReLU + 2×ResBlock(512)
-  Split heads  :
-    z_head       : Linear(512→1) → sigmoid(·)×6.0  →  z_pred  (scalar)
-    sigma_z_head : Linear(512+15→128) → ReLU → Linear(128→1)  →  log σ_z
-                   Input: [trunk_features | mu_15.detach()]
-                   SED posterior informs z uncertainty; mu_15 weights are
-                   zero-initialized so phase 1 (frozen vae_head) is unaffected.
-    vae_head     : Linear(512+1→30) → mu_15 / log_var_15  (15-param posterior)
-                   Conditioned on z_pred.detach() to keep z_head gradient clean.
+  Shared trunk : Linear(40→512) + BN + ReLU + 2×ResBlock(512)   (identical
+                 topology to PhotozEncoder in photoz_vae.py)
+  z_head       : Linear(512→128) + ReLU + Linear(128→2) → (mu_z, log_var_z)
+                 A dedicated 2-layer MLP (vs. the reference's single Linear
+                 slice) — this is the "extra layer" for z and its σ_z, giving
+                 redshift its own capacity instead of sharing one output row
+                 with 15 other parameters.
+  vae_head     : Linear(512+1→30) → (mu_15, log_var_15)
+                 Same single-Linear simplicity as the reference model, with
+                 one tweak: +1 input channel for the redshift estimate, so
+                 the 15-param posterior is conditioned on z. Reads
+                 h.detach() — see "Gradient flow" below.
 
-  Frozen decoder (same as PhotozVAE):
+  Frozen decoder (identical to PhotozVAE):
     theta_full = cat([z_pred.detach(), constrain_params_15(z_raw_15)], dim=1)
     SpeculatorInoueIGM(theta_full) → log_spec
-    FilterConv(log_spec, z=theta_full[:,0], logmass=theta_full[:,1]) → 10 AB mags
-    z_pred is detached in decode() so reconstruction trains only theta_15;
-    z_pred receives gradients exclusively from the supervised z loss.
+    FilterConv(log_spec, z=theta_full[:,0], logmass=theta_full[:,1]) → AB mags
 
-Loss (three terms, same structure as PhotozVAE)
------------------------------------------------
-  L_total = λ_z  × NLL_z(z_pred, z_spec, σ_z)          MLP z head
-          + λ_r  × Σ mask_i (m̂_i − m_i)² / (σ_i²+σ_f²) reconstruction
-          + β    × D_KL[ N(μ_15,σ_15²) ‖ N(0,I) ]       KL on 15-param latent
+Redshift latent (mimics photoz_vae.py's treatment of zred exactly, just
+isolated to its own 1-dim Gaussian instead of column 0 of a 16-dim one):
+  z_raw ~ N(mu_z, exp(log_var_z))            reparameterized sample
+  z_pred = sigmoid(z_raw) × 5.5               physical redshift
+  σ_z_phys = delta-method push-forward of σ_z_raw through sigmoid(·)×5.5
+             (see `_zred_sigma_phys`) — no separate sigma head; log_var_z
+             plays the same role here that log_var[:,0] plays in PhotozVAE.
+  The supervised NLL is evaluated at z_pred (the sample), for the same
+  reason given in photoz_vae.py: it gives log_var_z a direct calibration
+  signal from the label instead of shaping it only through β·KL.
 
-Gradient flows (phase 2)
-------------------------
-  z_pred   ← z_supervised NLL only  (h detached before vae_head; no recon→trunk path)
-  theta_15 ← reconstruction + KL   (SED shape learning; reads h.detach() read-only)
-  σ_z      ← NLL calibration via sigma_z_head([h, mu_15.detach()])
-              recon/KL shapes mu_15 → sigma_z_head reads updated mu_15 each step
-              → SED reconstruction quality informs z uncertainty
+Loss (three terms, same structure as PhotozVAE.loss)
+-----------------------------------------------------
+  L_total = λ_z × NLL_z(z_pred, z_spec, σ_z)            z-head, always on
+          + λ_r × Σ mask_i (m̂_i − m_i)² / (σ_i²+σ_f²)   reconstruction
+          + β   × D_KL[ N(μ_15,σ_15²) ‖ N(0, I) ]        KL, 15-param latent only
+
+Redshift carries no KL term — it is a supervised latent, not an
+unsupervised one; its only pressure is the NLL against z_spec. The KL term
+covers exactly the 15 SPS parameters, matching the request to add the KL
+loss "with the rest of 15 SPS parameters" in stage 2.
 
 Training stages
 ---------------
-  Phase 1 (warmup): vae_head frozen, λ_r=0, β=0, use_nll_z=False
-      Trunk + z_head + sigma_z_head learn from z-supervised MSE.
-      sigma_z_head receives random mu_15 but ignores it (zero-initialized weights).
-  Phase 2 (joint):  vae_head unfrozen via add_param_group() (preserves trunk/z_head
-      Adam momentum); LR scaled down by phase2_lr_frac; λ_r ramped, β annealed.
-      sigma_z_head gradually learns to use the now-informative mu_15 for better
-      uncertainty calibration — this is the SED→photo-z information pathway.
+  Stage 1 (warmup): vae_head frozen, λ_r=0, β=0, use_nll_z can be False→True
+      Trunk + z_head train from z-supervised NLL only. vae_head still runs
+      forward (SPS sampling already depends on z_pred), but it is frozen and
+      unweighted, so it draws no gradient yet.
+  Stage 2 (joint): vae_head unfrozen, λ_r ramped, β annealed 0→β_max.
+      vae_head now trains from reconstruction + KL. z_head keeps training
+      from its NLL term throughout — nothing freezes it in stage 2.
 
-SPS parameter ordering in theta_full (16 dims)
-----------------------------------------------
-  Φ = standard-normal CDF; latent ~ N(0,I) → Uniform over each range.
-  0   zred               z_pred (from MLP z-head, sigmoid×6.0)
-  1   logmass            Φ(·)×6.0 + 7.0             [7,   13.0]
-  2   logzsol            Φ(·)×2.17 − 1.98           [−1.98, 0.19]
-  3   dust2              Φ(·)×4.0                   [0,   4.0]
-  4   dust1_fraction     Φ(·)×2.0                   [0,   2.0]
-  5   dust_index         Φ(·)×1.4 − 1.0             [−1.0, 0.4]
-  6   gas_logz           Φ(·)×2.5 − 2.0             [−2.0, 0.5]
-  7   fagn               10^(Φ(·)×5.477 − 5)        [1e-5, ~3]
-  8   agn_tau            10^(Φ(·)×1.477 + 0.699)    [5,   150]
-  9   igm_scale          Φ(·)×2.0                   [0,   2.0]
-  10-15 logsfr_ratios_0..5  Φ(·)×10.0 − 5.0         [−5,  5]
+Gradient flow
+-------------
+  z_pred, σ_z ← z NLL only (trunk + z_head)
+  mu_15, log_var_15 ← reconstruction + KL only (vae_head)
+  vae_head reads [h.detach(), z_pred.detach()]: reconstruction/KL gradient
+  cannot reach the trunk or the z branch. This mirrors the fix found in the
+  obs_v6 run of the old 3-head MLPVAE (recon gradient leaking back through
+  vae_head → trunk measurably degraded z_pred quality once λ_r ramped up).
+  Here it is baked in from the start rather than patched in later: the
+  z branch is trained to convergence on its own signal, and the SPS/SED
+  branch is trained to converge in the parameter space *given* that
+  redshift, never the other way around.
+
+SPS parameter ordering in theta_full (16 dims) — identical to PhotozVAE,
+zred transform identical, 15-param transforms identical (just reindexed):
+  0   zred               sigmoid(·) × 5.5           [0,   5.5]
+  1   logmass            sigmoid(·) × 5.5 + 7.0     [7,   12.5]
+  2   logzsol            tanh(·) × 1.085 − 0.895    [−1.98, 0.19]
+  3   dust2              sigmoid(·) × 4.0           [0,   4.0]
+  4   dust1_fraction     sigmoid(·) × 2.0           [0,   2.0]
+  5   dust_index         tanh(·) × 0.7 − 0.3        [−1.0, 0.4]
+  6   gas_logz           tanh(·) × 1.25 − 0.75      [−2.0, 0.5]
+  7   fagn               10^(sigmoid(·)×5.477 − 5)  [1e-5, ~3]
+  8   agn_tau            10^(sigmoid(·)×1.477+0.699)[5,   150]
+  9   igm_scale          sigmoid(·) × 2.0           [0,   2.0]
+  10-15 logsfr_ratios_0..5  tanh(·) × 5.0           [−5,  5]
+
+Usage
+-----
+    model = PhotozMLPVAE(speculator_dir, filter_dir)
+    mags_recon, z_pred, mu_z, log_var_z, mu_15, log_var_15 = model(x_phot)
+    losses = model.loss(x_phot, mags_obs, mag_errs, mask, z_spec)
+    z_samples, z_mean, z_std = model.predict_z(x_phot, n_samples=500)
 """
 
 import os
@@ -67,16 +103,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from photoz_ae.model.vae_encoder import _ResBlock
-from photoz_ae.model.speculator_torch import SpeculatorInoueIGM
-from photoz_ae.model.filter_conv import FilterConv
+from photoz_vae.model.vae_encoder import _ResBlock
+from photoz_vae.model.speculator_torch import SpeculatorInoueIGM
+from photoz_vae.model.filter_conv import FilterConv
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parameter names
+# Parameter map
 # ─────────────────────────────────────────────────────────────────────────────
 
 PARAM_NAMES = [
-    "zred",             # 0  — from MLP z-head, not VAE latent
+    "zred",             # 0  — from the dedicated z MLP head, not the VAE latent
     "logmass",          # 1
     "logzsol",          # 2
     "dust2",            # 3
@@ -93,32 +129,27 @@ PARAM_NAMES = [
     "logsfr_ratios_4",  # 14
     "logsfr_ratios_5",  # 15
 ]
-
 PARAM_NAMES_15 = PARAM_NAMES[1:]   # the 15 VAE-encoded params (excludes zred)
-N_PARAMS_15    = 15
-N_PARAMS_FULL  = 16
+
+N_PARAMS_15   = 15
+N_PARAMS_FULL = 16
 
 ZRED_IDX_FULL    = 0   # column index in theta_full
 LOGMASS_IDX_FULL = 1   # column index in theta_full
+LOGZSOL_IDX_FULL = 2   # column index in theta_full
 
-_ZRED_MAX_SPEC   = 6.0  # speculator training range
-
-_SQRT2 = 2.0 ** 0.5
-
-def _Phi(z: torch.Tensor) -> torch.Tensor:
-    """Standard-normal CDF: maps N(0,1) → Uniform(0,1) marginally."""
-    return 0.5 * (1.0 + torch.erf(z / _SQRT2))
+# Speculator is trained on zred ∈ [0, 5.5]; clamp decoder input to this range
+_ZRED_MAX_SPEC = 6.5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constrain 15 SPS params (all except zred)
+# Bounded parameter transforms  (unconstrained → physical)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def constrain_params_15(z_raw_15: torch.Tensor) -> torch.Tensor:
     """
     Map unconstrained 15-dim latent → physical SPS params (zred excluded).
-
-    Input/output order matches PARAM_NAMES_15 (logmass … logsfr_ratios_5).
+    Identical transforms to PhotozVAE.constrain_params, indices 1-15.
 
     Parameters
     ----------
@@ -128,38 +159,60 @@ def constrain_params_15(z_raw_15: torch.Tensor) -> torch.Tensor:
     -------
     theta_15 : (batch, 15)  physical SPS parameters (no zred)
     """
-    p = _Phi(z_raw_15)   # (batch, 15)  element-wise ∈ (0, 1)
     parts = [
-        p[:, 0:1]  * 6.0   + 7.0,                        # logmass        [7,   13.0]
-        p[:, 1:2]  * 2.17  - 1.98,                       # logzsol        [-1.98, 0.19]
-        p[:, 2:3]  * 4.0,                                 # dust2          [0,   4.0]
-        p[:, 3:4]  * 2.0,                                 # dust1_fraction [0,   2.0]
-        p[:, 4:5]  * 1.4   - 1.0,                        # dust_index     [-1.0, 0.4]
-        p[:, 5:6]  * 2.5   - 2.0,                        # gas_logz       [-2.0, 0.5]
-        torch.pow(10.0, p[:, 6:7]  * 5.477 - 5.0),       # fagn           [1e-5, ~3]
-        torch.pow(10.0, p[:, 7:8]  * 1.477 + 0.699),     # agn_tau        [5,   150]
-        p[:, 8:9]  * 2.0,                                 # igm_scale      [0,   2.0]
-        p[:, 9:]   * 10.0  - 5.0,                        # logsfr_ratios  [-5,  5]
+        torch.sigmoid(z_raw_15[:, 0:1])  * 5.5 + 7.0,                       # logmass
+        torch.tanh(z_raw_15[:, 1:2])     * 1.085 - 0.895,                   # logzsol
+        torch.sigmoid(z_raw_15[:, 2:3])  * 4.0,                            # dust2
+        torch.sigmoid(z_raw_15[:, 3:4])  * 2.0,                            # dust1_fraction
+        torch.tanh(z_raw_15[:, 4:5])     * 0.7 - 0.3,                       # dust_index
+        torch.tanh(z_raw_15[:, 5:6])     * 1.25 - 0.75,                     # gas_logz
+        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 6:7]) * 5.477 - 5.0),     # fagn
+        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 7:8]) * 1.477 + 0.699),   # agn_tau
+        torch.sigmoid(z_raw_15[:, 8:9])  * 2.0,                            # igm_scale
+        torch.tanh(z_raw_15[:, 9:])      * 5.0,                             # logsfr_ratios_0..5
     ]
     return torch.cat(parts, dim=1)   # (batch, 15)
 
 
+# Numerical floor on the delta-method physical σ_z — prevents 1/σ² blowup
+# where the sigmoid Jacobian is tiny (z near 0 or 5.5).
+_ZRED_SIGMA_FLOOR = 1e-3
+
+
+def _zred_sigma_phys(mu_z: torch.Tensor, log_var_z: torch.Tensor) -> torch.Tensor:
+    """
+    Physical-space σ_z, propagated from the raw-space posterior
+    N(mu_z, var_z) through the sigmoid(·)×5.5 transform via a first-order
+    (delta-method) Jacobian evaluated at the mean:
+
+        σ_z_phys ≈ σ_z_raw × d(sigmoid(z_raw)×5.5)/dz_raw |_{z_raw=mu_z}
+                 = σ_z_raw × 5.5 × s(1-s),   s = sigmoid(mu_z)
+
+    Identical formula to PhotozVAE._zred_sigma_phys, applied to the
+    standalone z latent instead of column 0 of the joint 16-dim one.
+    """
+    s   = torch.sigmoid(mu_z)
+    jac = 5.5 * s * (1.0 - s)
+    sigma_raw = torch.exp(0.5 * log_var_z)
+    return (sigma_raw * jac).clamp(min=_ZRED_SIGMA_FLOOR)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Encoder: shared trunk + 3 split heads
+# Encoder: shared trunk + z head + SPS (VAE) head
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MLPVAEEncoder(nn.Module):
     """
-    Shared ResBlock trunk with three split heads:
-      - z_head       : Linear(width→1)  → sigmoid(·)×5.5  →  z_pred
-      - sigma_z_head : Linear(width→1)                    →  log σ_z
-      - vae_head     : Linear(width→30) → mu_15 / log_var_15
+    Shared ResBlock trunk (identical to PhotozEncoder) feeding two heads:
+      - z_head   : 2-layer MLP → (mu_z, log_var_z), 1-dim redshift latent
+      - vae_head : single Linear → (mu_15, log_var_15), 15-dim SPS latent,
+                   conditioned on the z estimate
 
     Parameters
     ----------
     n_in    : input dimension (default 40)
     width   : hidden width (default 512)
-    n_latent: VAE latent dimension = 15 SPS params (excludes zred)
+    n_latent: SPS latent dimension (default 15, excludes zred)
     dropout : dropout probability in ResBlocks (default 0.1)
     """
 
@@ -179,36 +232,25 @@ class MLPVAEEncoder(nn.Module):
             _ResBlock(width, dropout),
         )
 
-        # ── Split heads ───────────────────────────────────────────────────
-        self.z_head   = nn.Linear(width, 1)
-
-        # SED-informed uncertainty head: reads [trunk | SED_posterior.detach()].
-        # The mu_15 input weights are zero-initialized so that phase 1 behaviour
-        # (frozen vae_head producing random mu_15) is identical to the old Linear(width,1).
-        # During phase 2, as vae_head learns real SED posteriors, sigma_z_head
-        # gradually activates the mu_15 weights via the NLL calibration gradient.
-        self.sigma_z_head = nn.Sequential(
-            nn.Linear(width + n_latent, 128),
+        # ── z head: dedicated 2-layer MLP for (mu_z, log_var_z) ───────────
+        self.z_head = nn.Sequential(
+            nn.Linear(width, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(128, 2),
         )
 
-        # vae_head takes [trunk_features | z_pred] → width+1 inputs so that
-        # SPS parameter inference is explicitly conditioned on the predicted
-        # redshift (z_pred is detached to keep the z_head gradient path clean).
+        # ── SPS (VAE) head: single Linear, conditioned on z_pred ──────────
+        # +1 input channel is the only structural tweak vs. the reference
+        # model's Linear(width, n_latent*2). Reads h.detach() so that
+        # reconstruction/KL gradient never reaches the shared trunk (see
+        # module docstring, "Gradient flow").
         self.vae_head = nn.Linear(width + 1, n_latent * 2)
 
-        # Small-weight initialisation → stable KL and z predictions at epoch 0
-        for head in [self.z_head, self.vae_head]:
-            nn.init.xavier_uniform_(head.weight, gain=0.1)
-            nn.init.zeros_(head.bias)
-
-        # sigma_z_head: init trunk portion with small xavier, mu_15 portion with zeros
-        nn.init.xavier_uniform_(self.sigma_z_head[0].weight[:, :width], gain=0.1)
-        nn.init.zeros_(self.sigma_z_head[0].weight[:, width:])
-        nn.init.zeros_(self.sigma_z_head[0].bias)
-        nn.init.xavier_uniform_(self.sigma_z_head[2].weight, gain=0.1)
-        nn.init.constant_(self.sigma_z_head[2].bias, -1.0)  # σ_z ≈ 0.37 at init
+        # Small-weight init → stable KL / z predictions at epoch 0
+        nn.init.xavier_uniform_(self.z_head[-1].weight, gain=0.1)
+        nn.init.zeros_(self.z_head[-1].bias)
+        nn.init.xavier_uniform_(self.vae_head.weight, gain=0.1)
+        nn.init.zeros_(self.vae_head.bias)
 
     def forward(self, x: torch.Tensor):
         """
@@ -218,47 +260,47 @@ class MLPVAEEncoder(nn.Module):
 
         Returns
         -------
-        z_pred      : (batch,)         MLP redshift prediction  ∈ [0, 5.5]
-        log_sigma_z : (batch,)         log aleatoric z uncertainty
-        mu_15       : (batch, n_latent) VAE posterior means
-        log_var_15  : (batch, n_latent) VAE posterior log-variances
+        z_pred     : (batch,)          physical redshift (reparameterized
+                                        sample during training, mean at eval)
+        mu_z       : (batch,)          raw-space z posterior mean
+        log_var_z  : (batch,)          raw-space z posterior log-variance
+        mu_15      : (batch, n_latent) SPS posterior means, conditioned on z
+        log_var_15 : (batch, n_latent) SPS posterior log-variances
         """
         h = self.input_proj(x)
         h = self.res_blocks(h)
 
-        z_pred = torch.sigmoid(self.z_head(h).squeeze(1)) * _ZRED_MAX_SPEC
+        z_out     = self.z_head(h)
+        mu_z      = z_out[:, 0]
+        log_var_z = z_out[:, 1]#.clamp(-6.0, 4.0)
+        z_raw     = self.reparameterize(mu_z, log_var_z)
+        z_pred    = torch.sigmoid(z_raw) * _ZRED_MAX_SPEC
 
-        # VAE posterior: both h and z_pred are detached so reconstruction gradient
-        # cannot reach the trunk.  Trunk trains solely from z supervision + NLL.
-        z_h        = torch.cat([h.detach(), z_pred.detach().unsqueeze(1)], dim=1)  # (B, width+1)
-        vae_out    = self.vae_head(z_h)
+        # SPS sampling depends on the z estimate: vae_head reads
+        # [h.detach(), z_pred.detach()] so reconstruction/KL gradient stays
+        # confined to vae_head's own weights.
+        cond       = torch.cat([h.detach(), z_pred.detach().unsqueeze(1)], dim=1)
+        vae_out    = self.vae_head(cond)
         mu_15      = vae_out[:, :self.n_latent]
-        log_var_15 = vae_out[:, self.n_latent:].clamp(-6.0, 4.0)
+        log_var_15 = vae_out[:, self.n_latent:]#.clamp(-6.0, 4.0)
 
-        # SED-informed σ_z: sigma_z_head reads [trunk | SED_posterior.detach()].
-        # mu_15.detach() keeps vae_head's gradient path clean (recon+KL only);
-        # sigma_z_head still reads the mu_15 values, so SED information flows
-        # one-way into σ_z every forward pass.
-        sigma_in    = torch.cat([h, mu_15.detach()], dim=1)
-        log_sigma_z = self.sigma_z_head(sigma_in).squeeze(1).clamp(-5.0, 0.5)
+        return z_pred, mu_z, log_var_z, mu_15, log_var_15
 
-        return z_pred, log_sigma_z, mu_15, log_var_15
-
-    def reparameterize(self, mu_15: torch.Tensor,
-                       log_var_15: torch.Tensor) -> torch.Tensor:
-        """Reparameterisation trick for the 15-param VAE head."""
+    def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """Reparameterisation trick: z = μ + ε × exp(0.5 × log σ²)."""
         if self.training:
-            std = torch.exp(0.5 * log_var_15)
-            return mu_15 + torch.randn_like(std) * std
-        return mu_15
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu   # deterministic mean at eval time
 
     def freeze_vae_head(self):
-        """Freeze the 15-param VAE head (Phase 1 / z-supervised warmup)."""
+        """Freeze the 15-param SPS head (stage 1 / z-supervised warmup)."""
         for p in self.vae_head.parameters():
             p.requires_grad_(False)
 
     def unfreeze_vae_head(self):
-        """Unfreeze the 15-param VAE head (Phase 2 / joint fine-tuning)."""
+        """Unfreeze the 15-param SPS head (stage 2 / joint fine-tuning)."""
         for p in self.vae_head.parameters():
             p.requires_grad_(True)
 
@@ -269,7 +311,8 @@ class MLPVAEEncoder(nn.Module):
 
 class PhotozMLPVAE(nn.Module):
     """
-    2-Stage MLP-VAE for photometric redshift estimation.
+    Photometric-redshift MLP-VAE: z gets its own supervised latent + MLP
+    head; the remaining 15 SPS parameters keep a VAE latent conditioned on z.
 
     Parameters
     ----------
@@ -277,6 +320,7 @@ class PhotozMLPVAE(nn.Module):
     filter_dir     : str   path to obs_catalog/filters (Euclid .dat files)
     encoder_width  : int   hidden layer width (default 512)
     encoder_dropout: float dropout probability (default 0.1)
+    encoder_n_in   : int   input feature dimension (default 40)
     """
 
     def __init__(self,
@@ -287,13 +331,13 @@ class PhotozMLPVAE(nn.Module):
                  encoder_n_in: int = 40):
         super().__init__()
 
-        # ── Trainable encoder ─────────────────────────────────────────────
+        # ── Encoder (trainable) ───────────────────────────────────────────
         self.encoder = MLPVAEEncoder(
             n_in=encoder_n_in, width=encoder_width,
             n_latent=N_PARAMS_15, dropout=encoder_dropout,
         )
 
-        # ── Frozen decoder (same as PhotozVAE) ───────────────────────────
+        # ── Frozen decoder ────────────────────────────────────────────────
         self.speculator  = SpeculatorInoueIGM(speculator_dir)
         self.filter_conv = FilterConv(filter_dir, self.speculator.wl_rest)
 
@@ -306,65 +350,110 @@ class PhotozMLPVAE(nn.Module):
 
     def encode(self, x_phot: torch.Tensor):
         """
-        x_phot : (batch, 40)
-
-        Returns
-        -------
-        z_pred      : (batch,)
-        log_sigma_z : (batch,)
-        mu_15       : (batch, 15)
-        log_var_15  : (batch, 15)
-        z_raw_15    : (batch, 15)  reparameterized sample
+        x_phot : (batch, n_in) scaled photometric features
+        Returns z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15
         """
-        z_pred, log_sigma_z, mu_15, log_var_15 = self.encoder(x_phot)
+        z_pred, mu_z, log_var_z, mu_15, log_var_15 = self.encoder(x_phot)
         z_raw_15 = self.encoder.reparameterize(mu_15, log_var_15)
-        return z_pred, log_sigma_z, mu_15, log_var_15, z_raw_15
+        return z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15
 
     # ── Decode ────────────────────────────────────────────────────────────
 
-    def decode(self, z_pred: torch.Tensor,
-               z_raw_15: torch.Tensor) -> torch.Tensor:
+    def decode(self, z_pred: torch.Tensor, z_raw_15: torch.Tensor) -> torch.Tensor:
         """
-        Assemble full 16-dim SPS theta and run frozen decoder.
-
-        Parameters
-        ----------
-        z_pred   : (batch,)   redshift from MLP head  ∈ [0, 5.5]
-        z_raw_15 : (batch, 15) reparameterized 15-param latent
-
-        Returns
-        -------
-        m_ab : (batch, 10)  reconstructed AB magnitudes
+        z_pred   : (batch,)    physical redshift ∈ [0, 5.5] (sample or mean)
+        z_raw_15 : (batch, 15) unconstrained SPS latent
+        Returns m_ab : (batch, 10) reconstructed AB magnitudes
         """
-        theta_15   = constrain_params_15(z_raw_15)                   # (batch, 15)
-        # Detach z_pred: reconstruction trains theta_15 (SED shape) only.
+        theta_15 = constrain_params_15(z_raw_15)
+
+        # Detach z_pred: reconstruction trains theta_15 (SED shape) only;
         # z_pred receives gradients exclusively from the supervised z loss.
         zred_dec   = z_pred.detach().clamp(max=_ZRED_MAX_SPEC)
-        theta_full = torch.cat([zred_dec.unsqueeze(1), theta_15], dim=1)  # (batch, 16)
+        theta_full = torch.cat([zred_dec.unsqueeze(1), theta_15], dim=1)
 
         log_spec, _ = self.speculator(theta_full)
         m_ab = self.filter_conv(log_spec,
                                 theta_full[:, ZRED_IDX_FULL],
-                                theta_full[:, LOGMASS_IDX_FULL])      # (batch, 10)
+                                theta_full[:, LOGMASS_IDX_FULL])
         return m_ab
 
     # ── Forward ───────────────────────────────────────────────────────────
 
     def forward(self, x_phot: torch.Tensor):
         """
-        Full forward pass.
+        Returns
+        -------
+        m_ab_recon : (batch, 10)
+        z_pred     : (batch,)
+        mu_z       : (batch,)
+        log_var_z  : (batch,)
+        mu_15      : (batch, 15)
+        log_var_15 : (batch, 15)
+        """
+        z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15 = self.encode(x_phot)
+        m_ab_recon = self.decode(z_pred, z_raw_15)
+        return m_ab_recon, z_pred, mu_z, log_var_z, mu_15, log_var_15
+
+    # ── Diagnostic interface (shared with photoz_utils) ───────────────────
+
+    def encode_theta(self, x: torch.Tensor):
+        """
+        Standard diagnostic interface.
 
         Returns
         -------
-        m_ab_recon  : (batch, 10)
-        z_pred      : (batch,)
-        mu_15       : (batch, 15)
-        log_var_15  : (batch, 15)
-        log_sigma_z : (batch,)
+        z_pred      : (batch,)    physical redshift  ∈ [0, 5.5]
+        log_sigma_z : (batch,)    log σ_z, derived from log_var_z
+        theta_full  : (batch, 16) physical SPS parameters
         """
-        z_pred, log_sigma_z, mu_15, log_var_15, z_raw_15 = self.encode(x_phot)
-        m_ab_recon = self.decode(z_pred, z_raw_15)
-        return m_ab_recon, z_pred, mu_15, log_var_15, log_sigma_z
+        _, mu_z, log_var_z, mu_15, _ = self.encoder(x)
+        z_pred      = torch.sigmoid(mu_z) * _ZRED_MAX_SPEC
+        log_sigma_z = torch.log(_zred_sigma_phys(mu_z, log_var_z))
+        theta_15    = constrain_params_15(mu_15)
+        theta_full  = torch.cat([z_pred.unsqueeze(1), theta_15], dim=1)
+        return z_pred, log_sigma_z, theta_full
+
+    @torch.no_grad()
+    def sample_theta_posterior(self, x, n_samples: int, device: str, rng):
+        """
+        Draw posterior samples for each galaxy.
+
+        z is sampled from its own raw-space Gaussian and pushed through
+        sigmoid(·)×5.5; the 15 SPS params are sampled independently from
+        the VAE posterior (mu_15, log_var_15), which was itself conditioned
+        on a single z point during the forward pass — same approximation
+        used by the reference model's posterior sampling (mu_15 is not
+        re-derived per z sample).
+
+        Returns
+        -------
+        samples : (N_gal, n_samples, 16)  numpy float32
+        """
+        if not isinstance(x, torch.Tensor):
+            x = torch.from_numpy(x.astype(np.float32)).to(device)
+        _, mu_z, log_var_z, mu_15, log_var_15 = self.encoder(x)
+        mu_z_np   = mu_z.cpu().numpy()
+        std_z_np  = np.exp(0.5 * log_var_z.cpu().numpy())
+        mu_15_np  = mu_15.cpu().numpy()
+        std_15_np = np.exp(0.5 * log_var_15.cpu().numpy())
+
+        n_gal = x.shape[0]
+        all_samples = np.empty((n_gal, n_samples, N_PARAMS_FULL), dtype=np.float32)
+        for i in range(n_gal):
+            eps_z   = rng.standard_normal(n_samples).astype(np.float32)
+            z_raw_s = mu_z_np[i] + eps_z * std_z_np[i]
+            z_s     = 1.0 / (1.0 + np.exp(-z_raw_s)) * _ZRED_MAX_SPEC
+            z_s     = np.clip(z_s, 0.0, _ZRED_MAX_SPEC)
+
+            eps_15   = rng.standard_normal((n_samples, 15)).astype(np.float32)
+            z_raw_15 = mu_15_np[i] + eps_15 * std_15_np[i]
+            with torch.no_grad():
+                theta_15 = constrain_params_15(
+                    torch.from_numpy(z_raw_15).to(device)
+                ).cpu().numpy()
+            all_samples[i] = np.concatenate([z_s[:, None], theta_15], axis=1)
+        return all_samples
 
     # ── Loss ──────────────────────────────────────────────────────────────
 
@@ -385,37 +474,35 @@ class PhotozMLPVAE(nn.Module):
 
         Parameters
         ----------
-        x_phot    : (batch, 40)
+        x_phot    : (batch, n_in)
         mags_obs  : (batch, 10)  observed AB mags
         mag_errs  : (batch, 10)  observed mag errors
         mask      : (batch, 10)  1 = band present
         z_spec    : (batch,)     spectroscopic redshift
-        lam_z     : supervised z weight
-        lam_r     : reconstruction weight
-        beta      : KL weight (annealed)
-        sigma_floor: floor on mag error for speculator mismatch
-        z_weights : (batch,) per-galaxy weights; None = uniform
-        use_nll_z : if True, use heteroscedastic NLL; if False, plain MSE
+        lam_z     : weight for the supervised redshift loss
+        lam_r     : weight for the reconstruction loss
+        beta      : KL weight (annealed 0→β_max in stage 2), 15-param latent only
+        z_weights : (batch,) per-galaxy loss weights; None = uniform
+        use_nll_z : True → heteroscedastic NLL; False → plain MSE (warmup)
 
         Returns
         -------
         dict: total, z_sup, recon, kl, log_sigma_z
         """
-        z_pred, log_sigma_z, mu_15, log_var_15, z_raw_15 = self.encode(x_phot)
+        z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15 = self.encode(x_phot)
         m_ab_recon = self.decode(z_pred, z_raw_15)
 
-        # ── 1. Supervised z loss ──────────────────────────────────────────
-        # z_pred is ALWAYS trained with plain MSE so the gradient is never
-        # diluted by a learnable σ_z (which would create a degenerate NLL
-        # fixed-point at z_pred = mean(z_true), σ_z large).
-        # When use_nll_z=True, σ_z is calibrated via a detached NLL term
-        # (sq_err.detach() breaks the gradient path to z_pred).
-        sq_err = (z_pred - z_spec) ** 2
+        # ── 1. Supervised redshift loss ───────────────────────────────────
+        # Point estimate uses the REPARAMETERIZED sample z_pred, for the
+        # same reason as PhotozVAE: this gives log_var_z a direct
+        # calibration signal from z_spec instead of shaping it only via KL
+        # (which redshift doesn't even have here — see term 3).
+        sq_err  = (z_pred - z_spec) ** 2
+        sigma_z = _zred_sigma_phys(mu_z, log_var_z)     # always, for logging
         if use_nll_z:
-            # calibration only – no gradient to z_pred from this term
-            inv_var     = torch.exp(-2.0 * log_sigma_z)
-            calibration = 0.5 * sq_err.detach() * inv_var + log_sigma_z
-            per_gal = sq_err + calibration
+            inv_var = 1.0 / (sigma_z ** 2)
+            nll     = 0.5 * sq_err * inv_var + torch.log(sigma_z)
+            per_gal = nll
         else:
             per_gal = sq_err
         if z_weights is not None:
@@ -424,7 +511,6 @@ class PhotozMLPVAE(nn.Module):
             loss_z = per_gal.mean()
 
         # ── 2. Noise-weighted reconstruction loss ─────────────────────────
-        # Slice decoder output to the observed band count (6 LSST or 10 LSST+Euclid).
         m_ab_recon = m_ab_recon[:, :mags_obs.shape[1]]
         _zero = torch.zeros(1, device=x_phot.device).squeeze()
         if lam_r > 0.0:
@@ -436,7 +522,8 @@ class PhotozMLPVAE(nn.Module):
         else:
             loss_r = _zero
 
-        # ── 3. KL on 15-param VAE latent ──────────────────────────────────
+        # ── 3. KL divergence on the 15-param SPS latent only ──────────────
+        # Redshift carries no KL term — it is purely supervised via term 1.
         if beta > 0.0:
             loss_kl = 0.5 * (
                 log_var_15.exp() + mu_15 ** 2 - 1.0 - log_var_15
@@ -451,7 +538,7 @@ class PhotozMLPVAE(nn.Module):
             "z_sup":       loss_z,
             "recon":       loss_r,
             "kl":          loss_kl,
-            "log_sigma_z": log_sigma_z.mean().detach(),
+            "log_sigma_z": torch.log(sigma_z).mean().detach(),
         }
 
     # ── Inference ─────────────────────────────────────────────────────────
@@ -459,25 +546,26 @@ class PhotozMLPVAE(nn.Module):
     @torch.no_grad()
     def predict_z(self, x_phot: torch.Tensor, n_samples: int = 500):
         """
-        Predict redshift posterior.
-
-        The deterministic point estimate is z_pred from the MLP z-head.
-        The predictive distribution samples z ~ N(z_pred, σ_z) using the
-        calibrated aleatoric uncertainty from sigma_z_head.
+        Predict redshift from the z-head posterior.
 
         Returns
         -------
-        z_samples : (batch, n_samples)  predictive samples ∈ [0, 5.5]
-        z_mean    : (batch,)            point estimate (z_pred)
-        z_std     : (batch,)            aleatoric σ_z
+        z_samples : (batch, n_samples)  redshift posterior samples
+        z_mean    : (batch,)            posterior mean (deterministic)
+        z_std     : (batch,)            posterior std, from log_var_z via
+                                         the delta-method (_zred_sigma_phys)
         """
-        z_pred, log_sigma_z, _, _ = self.encoder(x_phot)
-        z_std = torch.exp(log_sigma_z).clamp(min=1e-4)
+        _, mu_z, log_var_z, _, _ = self.encoder(x_phot)
 
-        eps       = torch.randn(z_pred.shape[0], n_samples, device=z_pred.device)
-        z_samples = (z_pred.unsqueeze(1) + eps * z_std.unsqueeze(1)).clamp(0.0, _ZRED_MAX_SPEC)
+        z_mean = torch.sigmoid(mu_z) * _ZRED_MAX_SPEC
+        z_std  = _zred_sigma_phys(mu_z, log_var_z)
 
-        return z_samples, z_pred, z_std
+        std     = torch.exp(0.5 * log_var_z)
+        z_raw_s = mu_z.unsqueeze(1) + std.unsqueeze(1) * torch.randn(
+            mu_z.shape[0], n_samples, device=mu_z.device)
+        z_samples = (torch.sigmoid(z_raw_s) * _ZRED_MAX_SPEC).clamp(0.0, _ZRED_MAX_SPEC)
+
+        return z_samples, z_mean, z_std
 
     @torch.no_grad()
     def predict_params(self, x_phot: torch.Tensor) -> torch.Tensor:
@@ -486,68 +574,13 @@ class PhotozMLPVAE(nn.Module):
 
         Returns
         -------
-        theta_full : (batch, 16)  [z_pred | constrain_params_15(mu_15)]
+        theta_full : (batch, 16)  [z_mean | constrain_params_15(mu_15)]
         """
-        z_pred, _, mu_15, _ = self.encoder(x_phot)
+        _, mu_z, _, mu_15, _ = self.encoder(x_phot)
+        z_mean     = torch.sigmoid(mu_z) * _ZRED_MAX_SPEC
         theta_15   = constrain_params_15(mu_15)
-        theta_full = torch.cat([z_pred.unsqueeze(1), theta_15], dim=1)
+        theta_full = torch.cat([z_mean.unsqueeze(1), theta_15], dim=1)
         return theta_full
-
-    # ── Diagnostic interface (shared with photoz_utils) ───────────────────
-
-    def encode_theta(self, x: torch.Tensor):
-        """
-        Standard diagnostic interface.
-
-        Returns
-        -------
-        z_pred      : (batch,)    physical redshift  ∈ [0, 5.5]
-        log_sigma_z : (batch,)    log aleatoric z uncertainty
-        theta_full  : (batch, 16) physical SPS parameters
-        """
-        z_pred, log_sigma_z, mu_15, _ = self.encoder(x)
-        theta_15   = constrain_params_15(mu_15)
-        theta_full = torch.cat([z_pred.unsqueeze(1), theta_15], dim=1)
-        return z_pred, log_sigma_z, theta_full
-
-    def sample_theta_posterior(self, x, n_samples: int, device: str, rng):
-        """
-        Draw posterior samples for each galaxy.
-
-        For PhotozMLPVAE, z is sampled from the NLL head (N(z_pred, σ_z²))
-        and the 15 SPS params are sampled from the VAE posterior.
-
-        Parameters
-        ----------
-        x        : (N_gal, 40)  numpy array or torch.Tensor  (scaled features)
-        n_samples: int
-        device   : str
-        rng      : numpy Generator (e.g. np.random.default_rng(0))
-
-        Returns
-        -------
-        samples : (N_gal, n_samples, 16)  numpy float32
-        """
-        if not isinstance(x, torch.Tensor):
-            x = torch.from_numpy(x.astype(np.float32)).to(device)
-        z_pred, log_sigma_z, mu_15, log_var_15 = self.encoder(x)
-        z_pred_np  = z_pred.cpu().numpy()
-        z_std_np   = np.exp(log_sigma_z.cpu().numpy())
-        mu_15_np   = mu_15.cpu().numpy()
-        std_15_np  = np.exp(0.5 * log_var_15.cpu().numpy())
-        n_gal = x.shape[0]
-        all_samples = np.empty((n_gal, n_samples, 16), dtype=np.float32)
-        for i in range(n_gal):
-            eps_z  = rng.standard_normal(n_samples).astype(np.float32)
-            z_samp = np.clip(z_pred_np[i] + eps_z * z_std_np[i], 0.0, _ZRED_MAX_SPEC)
-            eps_15   = rng.standard_normal((n_samples, 15)).astype(np.float32)
-            z_raw_15 = mu_15_np[i] + eps_15 * std_15_np[i]
-            with torch.no_grad():
-                theta_15 = constrain_params_15(
-                    torch.from_numpy(z_raw_15).to(device)
-                ).cpu().numpy()
-            all_samples[i] = np.concatenate([z_samp[:, None], theta_15], axis=1)
-        return all_samples
 
     # ── Serialisation ─────────────────────────────────────────────────────
 
@@ -577,15 +610,7 @@ class PhotozMLPVAE(nn.Module):
         model   = cls(speculator_dir, filter_dir,
                       encoder_width=cfg["width"],
                       encoder_n_in=cfg.get("n_in", 40))
-        missing, unexpected = model.load_state_dict(
-            payload["model_state"], strict=False)
-        if missing or unexpected:
-            import warnings
-            warnings.warn(
-                f"PhotozMLPVAE.load: {len(missing)} missing keys, "
-                f"{len(unexpected)} unexpected keys (architecture mismatch — "
-                "partial load; new heads use random init)."
-            )
+        model.load_state_dict(payload["model_state"])
         model.to(device)
         model.eval()
         return model, payload.get("scaler"), payload.get("col_medians")

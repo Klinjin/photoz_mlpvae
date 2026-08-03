@@ -30,7 +30,7 @@ _BASE = "/astro/users/lindajin"
 sys.path.insert(0, _BASE)
 
 from obs_catalog.dataloader import load_catalog, build_features
-from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
 from photoz_utils import plot_scatter
 
 SPECULATOR_DIR = os.path.join(_BASE, "speculator", "trained", "Inoue_IGM")

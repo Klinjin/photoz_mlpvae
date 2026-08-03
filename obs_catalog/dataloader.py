@@ -55,7 +55,7 @@ Constants (re-exported for convenience)
   GAAP_COLOR_PAIRS, GAAP_REF_MAG, GAAP_REF_ERR
   PSF_COLOR_PAIRS, PSF_REF_MAG, PSF_REF_ERR, CATALOG_DEFAULT
 
-Example – photoz_ae / photoz_mlpvae (72/8/20 split with val)
+Example – photoz_vae / photoz_mlpvae (72/8/20 split with val)
 -------------------------------------------------------------
     from obs_catalog.dataloader import (
         load_catalog, build_features, compute_z_weights, make_dataloader,

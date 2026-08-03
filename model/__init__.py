@@ -1,4 +1,4 @@
-from .photoz_mlpvae import (
+from .photoz_mlpvae_old import (
     PhotozMLPVAE,
     MLPVAEEncoder,
     constrain_params_15,

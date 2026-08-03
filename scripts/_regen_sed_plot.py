@@ -19,7 +19,7 @@ sys.path.insert(0, _BASE)
 
 from obs_catalog.dataloader import build_features, MAG_COLS, ERR_COLS, TARGET_COL
 from photoz_utils import plot_sed_reconstructions
-from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
 
 # ── Constants (must match train_synth.py) ─────────────────────────────────────
 MODEL_NAME       = "mlpvae_synth_v1"

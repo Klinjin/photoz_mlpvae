@@ -112,7 +112,6 @@ Z_WEIGHT_CAP  = 10.0        # cap z-weights at this multiple of mean (prevent 27
 
 PHASE2_TRUNK_LR_FRAC = 0.1  # no LR scaling at Phase 2 (v1 scheme)
 PHASE2_VAE_LR_FRAC   = 1.0  # vae_head at full LR (v1 scheme)
-SIGMA_Z_WARMUP       = 0    # 0 = always NLL on; sq_err.detach() already protects z_pred
 NMAD_AVG_WINDOW      = 5    # rolling-average window for checkpoint criterion (smooths 677-gal noise)
 TRAIN_PLAN          = "always sigma_NMAD for best model"  # "phase1_warmup_then_phase2" or "joint_training"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,8 +271,6 @@ def main():
                         help="Epochs to ramp λ_z back to full after β stabilizes")
     parser.add_argument("--sigma-floor",        type=float, default=SIGMA_FLOOR)
     parser.add_argument("--warmup-epochs",      type=int,   default=WARMUP_EPOCHS)
-    parser.add_argument("--sigma-z-warmup",     type=int,   default=SIGMA_Z_WARMUP,
-                        help="Phase-2 epochs before enabling z NLL and σ_z calibration")
     parser.add_argument("--phase2-trunk-lr-frac", type=float, default=PHASE2_TRUNK_LR_FRAC,
                         help="LR multiplier for trunk/z_head at Phase 2 start")
     parser.add_argument("--phase2-vae-lr-frac",   type=float, default=PHASE2_VAE_LR_FRAC,
@@ -289,6 +286,10 @@ def main():
                         help="Include Euclid bands (default: LSST-only)")
     parser.add_argument("--use-gaap",   action="store_true",
                         help="Use GAAP 1.0-arcsec aperture mags for LSST bands instead of cModel")
+    parser.add_argument("--model-version", choices=["old", "new"], default="old",
+                        help="'old' = 3-head photoz_mlpvae_old (16-dim joint VAE); "
+                             "'new' = photoz_mlpvae z-separated design (dedicated "
+                             "z MLP head, 15-param VAE head conditioned on z)")
     args = parser.parse_args()
 
     use_colors = not args.no_colors
@@ -325,7 +326,6 @@ def main():
         lam_r               = args.lam_r,
         sigma_floor         = args.sigma_floor,
         warmup_epochs       = args.warmup_epochs,
-        sigma_z_warmup      = args.sigma_z_warmup,
         phase2_trunk_lr_frac = args.phase2_trunk_lr_frac,
         phase2_vae_lr_frac  = args.phase2_vae_lr_frac,
         z_weight_cap        = args.z_weight_cap,
@@ -340,6 +340,7 @@ def main():
         speculator_dir      = SPECULATOR_DIR,
         filter_dir          = FILTER_DIR,
         training_scheme     = TRAIN_PLAN,
+        model_version       = args.model_version,
 
     )
     cfg_path = os.path.join(out_dir, "config.yaml")
@@ -383,7 +384,10 @@ def main():
     print(f"Encoder input dim: {X_tr.shape[1]}")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    if args.model_version == "new":
+        from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    else:
+        from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
 
     model = PhotozMLPVAE(SPECULATOR_DIR, FILTER_DIR,
                          encoder_n_in=X_tr.shape[1]).to(args.device)
@@ -475,19 +479,16 @@ def main():
         else:
             lam_z_eff = args.lam_z
 
-        # Delay σ_z NLL until VAE has warmed up (mu_15 is informative).
-        use_nll_z = (epoch > args.warmup_epochs + args.sigma_z_warmup)
-
         t0 = time.time()
 
         tr_loss  = run_epoch(model, tr_loader,  args.device, opt=opt,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
-                             use_nll_z=use_nll_z)
+                             use_nll_z=True)
         val_loss = run_epoch(model, val_loader, args.device, opt=None,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
-                             use_nll_z=use_nll_z)
+                             use_nll_z=True)
 
         model.eval()
         z_pred_val = []
@@ -620,8 +621,6 @@ def main():
     events = [
         (args.warmup_epochs,
          "Phase 2: VAE unfrozen, λ_z drops, λ_r & β begin"),
-        (args.warmup_epochs + args.sigma_z_warmup,
-         "σ_z NLL begins"),
         (args.warmup_epochs + RECON_RAMP,
          "λ_r & β fully on, λ_z restoring"),
         (args.warmup_epochs + BETA_EPOCHS + args.lam_z_restore,

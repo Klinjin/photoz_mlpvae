@@ -131,7 +131,6 @@ N_ZBINS_WEIGHT = 25
 # (The old PHASE2_LR_FRAC=0.1 crushed both to 1e-5 and prevented VAE learning.)
 PHASE2_TRUNK_LR_FRAC = 0.1   # protect trunk from noiseless recon gradient
 PHASE2_VAE_LR_FRAC   = 1.0
-SIGMA_Z_WARMUP       = 0    # 0 = σ_z NLL enabled at Phase 2 start
 NMAD_AVG_WINDOW      = 5    # rolling-average window for checkpoint criterion
 
 # Up-weight high-z galaxies during training to prevent trunk collapse on
@@ -514,8 +513,6 @@ def main():
                         help="λ_z floor during Phase 2 β-ramp (gives VAE gradient budget)")
     parser.add_argument("--lam-z-restore",      type=int,   default=LAM_Z_RESTORE,
                         help="Epochs to ramp λ_z back to full after β stabilises")
-    parser.add_argument("--sigma-z-warmup",     type=int,   default=SIGMA_Z_WARMUP,
-                        help="Phase-2 epochs before enabling σ_z NLL calibration")
     parser.add_argument("--phase2-trunk-lr-frac", type=float, default=PHASE2_TRUNK_LR_FRAC,
                         help="LR multiplier for trunk/z_head at Phase 2 start")
     parser.add_argument("--phase2-vae-lr-frac",   type=float, default=PHASE2_VAE_LR_FRAC,
@@ -535,6 +532,10 @@ def main():
     parser.add_argument("--use-gaap", action="store_true",
                         help="Use GAAP 1.0-arcsec aperture mags for LSST bands "
                              "(Euclid columns are unchanged)")
+    parser.add_argument("--model-version", choices=["old", "new"], default="old",
+                        help="'old' = 3-head photoz_mlpvae_old (16-dim joint VAE); "
+                             "'new' = photoz_mlpvae z-separated design (dedicated "
+                             "z MLP head, 15-param VAE head conditioned on z)")
     args = parser.parse_args()
 
     use_colors = not args.no_colors
@@ -588,7 +589,6 @@ def main():
         n_zbins_weight        = N_ZBINS_WEIGHT,
         lam_z_min             = args.lam_z_min,
         lam_z_restore         = args.lam_z_restore,
-        sigma_z_warmup        = args.sigma_z_warmup,
         phase2_trunk_lr_frac  = args.phase2_trunk_lr_frac,
         phase2_vae_lr_frac    = args.phase2_vae_lr_frac,
         nmad_avg_window       = NMAD_AVG_WINDOW,
@@ -601,6 +601,7 @@ def main():
         i_band_snr_min = args.i_band_snr_min,
         speculator_dir = SPECULATOR_DIR,
         filter_dir     = FILTER_DIR,
+        model_version  = args.model_version,
     )
     cfg_path = os.path.join(out_dir, "config.yaml")
     with open(cfg_path, "w") as f:
@@ -613,7 +614,10 @@ def main():
 
     # ── Load decoder (frozen) for photometry generation ───────────────────
     print("Loading Speculator + FilterConv …")
-    from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    if args.model_version == "new":
+        from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    else:
+        from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
     model_dec = PhotozMLPVAE(SPECULATOR_DIR, FILTER_DIR).to(args.device)
     model_dec.eval()
 
@@ -806,17 +810,15 @@ def main():
         else:
             lam_z_eff = args.lam_z
 
-        use_nll_z = (epoch > args.warmup_epochs + args.sigma_z_warmup)
-
         t0 = time.time()
         tr_loss  = run_epoch(model, tr_loader,  args.device, opt=opt,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
-                             use_nll_z=use_nll_z)
+                             use_nll_z=True)
         val_loss = run_epoch(model, val_loader, args.device, opt=None,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
-                             use_nll_z=use_nll_z)
+                             use_nll_z=True)
 
         model.eval()
         z_pred_val = []

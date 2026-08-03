@@ -449,7 +449,7 @@ def main():
           f"mean={zw.mean():.3f}  (high-z upweight={zw.max():.1f}x)")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
 
     torch.manual_seed(SEED)
     model = PhotozMLPVAE(SPECULATOR_DIR, FILTER_DIR,
