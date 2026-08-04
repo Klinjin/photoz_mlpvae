@@ -176,7 +176,7 @@ def constrain_params_15(z_raw_15: torch.Tensor) -> torch.Tensor:
 
 # Numerical floor on the delta-method physical σ_z — prevents 1/σ² blowup
 # where the sigmoid Jacobian is tiny (z near 0 or 5.5).
-_ZRED_SIGMA_FLOOR = 1e-3
+_ZRED_SIGMA_FLOOR = 1e-4
 
 
 def _zred_sigma_phys(mu_z: torch.Tensor, log_var_z: torch.Tensor) -> torch.Tensor:
@@ -192,7 +192,7 @@ def _zred_sigma_phys(mu_z: torch.Tensor, log_var_z: torch.Tensor) -> torch.Tenso
     standalone z latent instead of column 0 of the joint 16-dim one.
     """
     s   = torch.sigmoid(mu_z)
-    jac = 5.5 * s * (1.0 - s)
+    jac = _ZRED_MAX_SPEC * s * (1.0 - s)
     sigma_raw = torch.exp(0.5 * log_var_z)
     return (sigma_raw * jac).clamp(min=_ZRED_SIGMA_FLOOR)
 
