@@ -1,12 +1,32 @@
 # photoz_mlpvae
 
-2-Stage MLP-VAE for photometric redshift estimation. Redshift is predicted
-directly by a deterministic MLP head; the remaining 15 SPS parameters are
-encoded as a VAE latent. Both heads share a common ResBlock trunk.
+2-Stage MLP-VAE for photometric redshift estimation. Redshift and the
+remaining 15 SPS parameters are inferred by two heads (their split differs
+by model version, see below) sharing a common ResBlock trunk; the 15 SPS
+parameters are always a VAE latent.
 
 ---
 
 ## Architecture
+
+### Model versions (`--model-version {old,new}`)
+
+Both training scripts select between two architectures sharing the same
+trunk, decoder, and 3-term loss:
+
+| | `old` (default) — `model/photoz_mlpvae_old.py` | `new` (z-separated) — `model/photoz_mlpvae.py` |
+|---|---|---|
+| Diagram | below | below |
+| z estimate | deterministic z_head + separate `sigma_z_head` reading `[trunk \| mu_15.detach()]` | dedicated 1-dim z latent: 2-layer MLP → (mu_z, log_var_z); σ_z via delta-method push-forward, no separate head |
+| vae_head input | `[trunk, z_pred.detach()]` | `[h.detach(), z_pred.detach()]` — recon/KL gradient **cannot** reach trunk/z_head (isolation baked in from the start) |
+| Best dp1_v4 result | σ_NMAD 0.0587 / bias **0.0106** (`mlpvae_v2_lsst_gaap1p0`) | σ_NMAD **0.0298** / bias 0.0244 / RMS 0.2514 (`mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20`) |
+
+The z-separated model holds the current σ_NMAD/outlier records; the old
+model's bias number is a core/tail cancellation, not better calibration —
+see PLAN.md's Open Problems for the bias decomposition and the remaining
+data-limited low-z tail.
+
+#### `old` — 3-head joint-gradient model (`model/photoz_mlpvae_old.py`)
 
 ```
 x_phot (B, D)   D = 26 (LSST-only+det), 24 (LSST-only), 42 (LSST+Euclid+det), 40 (LSST+Euclid)
@@ -45,9 +65,14 @@ x_phot (B, D)   D = 26 (LSST-only+det), 24 (LSST-only), 42 (LSST+Euclid+det), 40
         └──────────────────────┘
 ```
 
-**z_head injection into vae_head**: the VAE posterior head receives
-`[trunk_features (512) | z_pred (1)]` (513-dim input) so SPS inference is
-conditioned on redshift. `z_pred` is detached before concatenation.
+`z_head` is a bare deterministic `Linear(512→1)` → `sigmoid×5.5` point
+estimate — no distribution, no reparameterization for z. **z_head injection
+into vae_head**: the VAE posterior head receives
+`[trunk_features (512) | z_pred (1)]` (513-dim input, trunk NOT detached) so
+SPS inference is conditioned on redshift; `z_pred` itself is detached before
+concatenation, but reconstruction/KL gradient can still reach the shared
+trunk through the undetached `trunk_features` term (patched afterward per
+Failure 4c/obs_v6 in PLAN.md, not structurally prevented).
 
 **sigma_z_head** reads `[trunk | mu_15.detach()]` so that the predicted SED
 posterior informs per-galaxy uncertainty estimates. The mu_15 portion is
@@ -57,6 +82,69 @@ it activates gradually as mu_15 becomes informative during Phase 2.
 **z_mu vs z_sample**: `z_pred` (z_mu) is the point estimate for NMAD/bias/OLF
 metrics. `z_samples = N(z_pred, σ_z²)` adds aleatoric noise and should only
 be used for calibration / PIT tests.
+
+#### `new` — z-separated model (`model/photoz_mlpvae.py`)
+
+```
+x_phot (B, D)   D = 26 (LSST-only+det), 24 (LSST-only), 42 (LSST+Euclid+det), 40 (LSST+Euclid)
+    │
+    ▼
+┌────────────────────────────────────────┐
+│           Shared trunk                 │
+│  Linear(D → 512) + BatchNorm + ReLU   │
+│  ResBlock(512, dropout=0.1)            │
+│  ResBlock(512, dropout=0.1)            │
+└───┬────────────────────────┬───────────┘
+    │ h                      │ h.detach()
+┌───▼──────────────┐   ┌─────▼──────────────────────────────┐
+│     z_head        │   │             vae_head                │
+│ Linear(512→128)   │   │  input = cat([h.detach(),           │
+│ + ReLU +          │   │               z_pred.detach()])     │
+│ Linear(128→2)     │   │  Linear(513→30) → mu_15, log_var_15 │
+│ → mu_z, log_var_z │   │  + reparameterize → z_raw_15        │
+└───┬───────────────┘   └─────────────┬────────────────────────┘
+    │ reparameterize                  │
+    │ z_raw ~ N(mu_z, var_z)          constrain_params_15(z_raw_15)
+    │ z_pred = sigmoid(z_raw)×5.5     │         (B, 15)
+    └──────────────┬───────────────────┘
+                   │
+          theta_full = cat([z_pred, theta_15], dim=1)   (B, 16)
+                   │
+                   ▼
+        ┌──────────────────────┐
+        │   Speculator (frozen)│
+        │  theta → log_spec    │
+        └──────────┬───────────┘
+                   ▼
+        ┌──────────────────────┐
+        │     FilterConv       │  (frozen)
+        │  log_spec + z + mass │
+        │  → 10 AB mags        │
+        └──────────────────────┘
+```
+
+`z_head` is a dedicated 2-layer MLP — not a shared output row — producing
+`(mu_z, log_var_z)` for a private 1-dim redshift latent. `z_pred` is the
+**reparameterized sample** `sigmoid(z_raw)×5.5` (not the mean, and not a
+bare point-regression output as in the old model): this is what gives
+`log_var_z` a real calibration gradient from the label instead of drifting
+under KL pressure alone (redshift itself carries no KL term — it's purely
+supervised via NLL).
+
+**No separate sigma_z_head**: σ_z is derived analytically from `log_var_z`
+via a delta-method push-forward through the sigmoid transform
+(`_zred_sigma_phys`) — the same mechanism `photoz_vae.py` uses for its
+jointly-encoded zred. This removes the old model's SED→z-uncertainty
+information channel (`sigma_z_head` reading `mu_15.detach()`) entirely.
+
+**vae_head isolation baked in from the start**: reads
+`[h.detach(), z_pred.detach()]`, so reconstruction/KL gradient can never
+reach the trunk or z branch, by construction — not a later patch like the
+old model's Failure 4c/obs_v6 fix.
+
+**z_mu vs z_sample**: same convention as the old model — `z_pred` is the
+point estimate for NMAD/bias/OLF metrics; `z_samples` (drawn from the
+z-latent's own posterior) are for calibration / PIT only.
 
 ### SPS parameter ordering in `theta_full` (16 dims)
 
@@ -179,25 +267,36 @@ Default weights: `λ_z = 20`, `λ_r = 0.1` (real data) / `0.3` (synthetic), `β_
 
 ## Training phases
 
-### Phase 1 — z-supervised warmup (`warmup_epochs`, default 50)
+### Phase 1 — z-supervised warmup
+- Duration: `--warmup-epochs`; `train_dp1.py` defaults to **10% of total
+  epochs**, `train_synth.py` to a fixed 50
 - `vae_head` weights **frozen**
-- `λ_r = 0`, `β = 0`, `use_nll_z = False` (plain MSE only)
-- Only trunk + `z_head` + `sigma_z_head` are updated
-- sigma_z_head receives no gradient (not in the MSE loss); it exits Phase 1
-  holding its initialization weights
+- `λ_r = 0`, `β = 0`
+- `use_nll_z = True` from epoch 1 (both scripts) — z trains on NLL so
+  `log_var_z` / σ_z is calibrated throughout, never on bare MSE
+- Only trunk + z branch (+ `sigma_z_head` in the old model) are updated
 
 ### Phase 2 — joint fine-tuning (remaining epochs)
 - `vae_head` **unfrozen** via `opt.add_param_group()` (preserves trunk Adam
   momentum; prevents z_pred spike from optimizer reset)
-- Trunk / z_head / sigma_z_head LR scaled by `phase2_trunk_lr_frac` (default **0.1**)
-  to prevent noiseless reconstruction gradients from disrupting the z solution
+- Trunk / z-branch LR: `train_dp1.py` keeps it on its single continuous
+  cosine schedule (no Phase-2 rescale — the z-separated model's `h.detach()`
+  makes the old ×0.1 cut unnecessary); `train_synth.py` still scales it by
+  `phase2_trunk_lr_frac` (default 0.1) against its stronger noiseless
+  reconstruction gradients
 - `λ_r` ramped 0 → `lam_r` over `recon_ramp` epochs (default 50)
 - `β` annealed 0 → `beta_max` over `beta_epochs` epochs (default 50)
 - `λ_z` drops to `lam_z_min` (default **2.0**) at Phase 2 start, then
   restored to `lam_z` over `lam_z_restore` epochs (default 50) — gives the
   VAE head gradient budget during the β ramp without z_pred degrading
-- `use_nll_z = True` from epoch `warmup_epochs + sigma_z_warmup` onward
-  (sigma_z_warmup=0 means NLL activates immediately at Phase 2 start)
+
+### Gradient clipping (both phases)
+`clip_grad_norm_(encoder.parameters(), --grad-clip-max-norm)` (default
+**2.0**) is applied every step and binds on essentially every batch — it
+acts as always-on gradient normalization, not an emergency brake, and
+removing it measurably hurts every test metric (see PLAN.md, Failure 11).
+Per-epoch LR and pre-clip gradient norms are logged and plotted to
+`lr_and_gradnorm.png`.
 
 ### λ_z schedule (Phase 2)
 
@@ -239,23 +338,26 @@ CUDA_VISIBLE_DEVICES=0 ~/miniforge3/envs/WL_ML_Challenge/bin/python \
 | Flag | Default (synth / dp1) | Description |
 |------|-----------------------|-------------|
 | `--model-name` | `mlpvae_synth_v1` / `mlpvae_v1_lsst` | Output directory |
+| `--model-version` | `old` | `old` = 3-head joint-VAE model; `new` = z-separated model |
 | `--use-gaap` | off | Use GAAP 1.0-arcsec aperture mags for LSST bands |
 | `--no-euclid` | off (synth) / on (dp1) | LSST-only 6-band encoder |
 | `--no-colors` | off | Raw magnitudes instead of colours |
-| `--warmup-epochs` | 50 | Phase 1 duration (z-supervised, vae_head frozen) |
+| `--warmup-epochs` | 50 / **10% of `--epochs`** | Phase 1 duration (z-supervised, vae_head frozen) |
 | `--lam-z` | 20.0 | Supervised z loss weight |
 | `--lam-z-min` | 2.0 | λ_z floor during Phase 2 β ramp |
 | `--lam-z-restore` | 50 | Epochs to ramp λ_z back from min to full |
 | `--lam-r` | 0.3 / 0.1 | Reconstruction loss weight |
 | `--sigma-floor` | 0.3 | Magnitude error floor for Speculator mismatch |
-| `--phase2-trunk-lr-frac` | 0.1 | LR multiplier for trunk/z_head at Phase 2 start |
+| `--phase2-trunk-lr-frac` | 0.1 (synth only) | LR multiplier for trunk/z_head at Phase 2 start (removed from `train_dp1.py`) |
 | `--phase2-vae-lr-frac` | 1.0 | LR multiplier for vae_head at Phase 2 start |
-| `--sigma-z-warmup` | 0 | Extra Phase-2 epochs before σ_z NLL activates |
+| `--grad-clip-max-norm` | 2.0 (dp1 only) | Encoder gradient-norm clip; ≤0 disables (norm still logged) |
 | `--beta-max` | 0.1 | Peak β for KL annealing |
 | `--lr` | 1e-4 | Initial learning rate |
 | `--i-band-snr-min` | 5.0 (synth only) | Min i-band SNR for galaxy inclusion |
 | `--init-from` | None (dp1 only) | Checkpoint path for shape-matched warm-start |
 | `--z-weight-cap` | — / 10.0 | Cap z-weights at this multiple of mean |
+| `--trial` | off (dp1 only) | Comparison-trial mode: train + test metrics only, no figures |
+| `--out-base` | `trained/` (dp1 only) | Base directory for the run's output folder |
 
 ### Outputs (`photoz_mlpvae/trained/<model-name>/`)
 
@@ -263,6 +365,8 @@ CUDA_VISIBLE_DEVICES=0 ~/miniforge3/envs/WL_ML_Challenge/bin/python \
 - `config.yaml` — all hyperparameters
 - `train.log` — full stdout mirror
 - `train_curves.png` — loss / σ_NMAD curves with phase annotations
+- `lr_and_gradnorm.png` — per-epoch LR (both param groups) + pre-clip
+  gradient norm vs the clip threshold
 - `test_scatter.png`, `test_zdist.png`, `test_metrics_vs_z.png`
 - `test_metrics_paper_style.png`, `test_pit.png`
 - `test_predictions.csv` — `z_true`, `z_pred`, `z_std`, `delta_z`
@@ -289,31 +393,15 @@ theta_full = model.predict_params(x_phot)   # (N, 16) physical SPS params
 
 ---
 
-## Current best & changelog
+## Current best
 
-**Current best (real data)**: `mlpvae_v2_lsst_gaap1p0` (dp1_v4, LSST-only,
-GAAP 1.0", warm-started from `synth_v7`) — **σ_NMAD = 0.0587** (test).
-
-Changelog (newest first, metric-moving changes only):
-
-- Euclid bands tested as additional input (LSST+Euclid, 40-dim encoder):
-  *degraded* real dp1_v4 performance, σ_NMAD 0.0587 → 0.0842, despite a more
-  accurate Euclid-native synth pretrain (0.0184 vs 0.0301 on synth test).
-  Not adopted — see PLAN.md.
-- `phase2_trunk_lr_frac` 1.0→0.1 + `lam_z_min` 20→2 (lsst_v4+): fixed a val
-  z-NLL oscillation at the start of Phase 2.
-- i-band SNR cut 20→5 (synth_v3+): restored faint high-z training galaxies
-  discarded by the stricter cut.
-- Detection features `frac_detected` / `frac_blue_detected` added to encoder
-  input (+2 dims, synth_v3+): broke a high-z feature degeneracy that was
-  collapsing predictions to a single value across a wide true-z range.
-- `z_boost_factor` (5.0 for z > 3) added to training weights (obs_v6+): fixed
-  40.6%-of-test-set collapse to a single high-z prediction.
-- Phase 2 now splices `vae_head` into the existing optimizer via
-  `opt.add_param_group()` instead of creating a fresh one (obs_v6+): fixed a
-  σ_NMAD 0.054→0.070 regression at the Phase 1→2 transition.
-- `h.detach()` before `vae_head` (obs_v6): fixed a reconstruction-gradient
-  collapse through the trunk.
+**Current best (real data, saved checkpoint)**:
+`mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20` (z-separated model, dp1_v4,
+LSST-only, GAAP 1.0", 2000 epochs / lr 1e-3 / `lam_z_min=20`, warm-started
+from `mlpvae_synth_zsep_v1`) — **σ_NMAD = 0.0298, bias = 0.0244,
+RMS = 0.2514** (test). See PLAN.md's changelog and Open Problems for the
+full tuning history and the bias decomposition (the old model's
+bias = 0.0106 is a core/tail cancellation, not better calibration).
 
 ---
 
@@ -325,7 +413,8 @@ photoz_mlpvae/
 ├── __init__.py
 ├── model/
 │   ├── __init__.py
-│   └── photoz_mlpvae.py          # MLPVAEEncoder, PhotozMLPVAE, constrain_params_15
+│   ├── photoz_mlpvae.py          # z-separated PhotozMLPVAE (--model-version new)
+│   └── photoz_mlpvae_old.py      # 3-head joint-VAE PhotozMLPVAE (--model-version old)
 ├── scripts/
 │   ├── __init__.py
 │   ├── train_synth.py            # Synthetic SED pre-training

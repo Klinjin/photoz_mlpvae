@@ -6,7 +6,179 @@ architecture and usage, see [README.md](README.md).
 
 ---
 
+## Changelog (moved from README.md, newest first, metric-moving changes only)
+
+- Epochs×LR sweep + `lam_z_min=20` (bias campaign, see Open Problems):
+  promoted `mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20` as new best —
+  σ_NMAD 0.0348 → **0.0298**, bias 0.0559 → **0.0244**, RMS 0.3012 → 0.2514.
+- epochs×LR trial sweep on the z-separated recipe (Phase-1 warmup now 10% of
+  total epochs): best trial (2000 epochs, lr 1e-3) σ_NMAD 0.0348 → 0.0291,
+  bias 0.0559 → 0.0258 (later promoted with `lam_z_min=20`, see above).
+- 1000-epoch run of the LR-fix recipe: bias 0.0689 → 0.0559, RMS
+  0.3413 → 0.3012 at flat σ_NMAD (0.0349 → 0.0348).
+- Gradient-clipping A/B: removing `clip_grad_norm_(2.0)` worsened all five
+  metrics (σ_NMAD 0.0349 → 0.0380, bias 0.0689 → 0.0896); clipping kept and
+  made explicit via `--grad-clip-max-norm` (Failure 11/12).
+- `phase2_trunk_lr_frac` removed from `train_dp1.py` (obsolete under the
+  z-separated model's `h.detach()` isolation): σ_NMAD 0.0442 → 0.0349
+  (Failure 10).
+- Phase-1 `use_nll_z` gating bug fixed (NLL-z on from epoch 1, no more σ_z
+  collapse → Phase-2 loss spike): σ_NMAD 0.0442 → 0.0391 (Failure 9).
+- z-separated model (`--model-version new`) + GAAP + synth warm-start:
+  σ_NMAD 0.0587 → 0.0442 (bias worsened 0.0106 → 0.0577 — see the bias
+  decomposition in Open Problems for why this "worse bias" is misleading).
+- Euclid bands tested as additional input (LSST+Euclid, 40-dim encoder):
+  *degraded* real dp1_v4 performance, σ_NMAD 0.0587 → 0.0842, despite a more
+  accurate Euclid-native synth pretrain (0.0184 vs 0.0301 on synth test).
+  Not adopted for the old model (Failure 7); near-parity when retried on the
+  z-separated model (see Open Problems, MDN + Euclid trials).
+- `phase2_trunk_lr_frac` 1.0→0.1 + `lam_z_min` 20→2 (lsst_v4+): fixed a val
+  z-NLL oscillation at the start of Phase 2 (Failure 6).
+- i-band SNR cut 20→5 (synth_v3+): restored faint high-z training galaxies
+  discarded by the stricter cut (Failure 5).
+- Detection features `frac_detected` / `frac_blue_detected` added to encoder
+  input (+2 dims, synth_v3+): broke a high-z feature degeneracy that was
+  collapsing predictions to a single value across a wide true-z range
+  (Failure 5).
+- `z_boost_factor` (5.0 for z > 3) added to training weights (obs_v6+): fixed
+  40.6%-of-test-set collapse to a single high-z prediction (Failure 2).
+- Phase 2 now splices `vae_head` into the existing optimizer via
+  `opt.add_param_group()` instead of creating a fresh one (obs_v6+): fixed a
+  σ_NMAD 0.054→0.070 regression at the Phase 1→2 transition (Failure 1).
+- `h.detach()` before `vae_head` (obs_v6): fixed a reconstruction-gradient
+  collapse through the trunk (Failure 4c).
+
+---
+
 ## Open problems
+
+### Target σ_NMAD ~2×10⁻² / bias ~10⁻³ not reachable via epochs×LR alone (z-separated model)
+
+A 12-trial sweep (2026-08-03) over total epochs × learning rate on the
+z-separated model's best recipe (`--model-version new --use-gaap`, warm-start
+from `mlpvae_synth_zsep_v1_no_euclid_gaap1p0`, grad clip 2.0, Phase-1 warmup =
+10% of total epochs, patience = epochs/5) mapped the space and hit a floor
+well short of the target. Trials ran in `--trial` mode (metrics only, no
+figures, scratchpad output — nothing promoted to `trained/`).
+
+σ_NMAD / bias per trial:
+
+| | lr 5e-5 | 1e-4 | 3e-4 | 5e-4 | **1e-3** | 2e-3 | 3e-3 |
+|---|---|---|---|---|---|---|---|
+| **e1500** | | | .0302/.0328 | | | | |
+| **e2000** | .0328/.0449 | .0310/.0365 | .0306/.0339 | .0308/.0363 | **.0291/.0258** | .0300/.0336 | .0302/.0367 |
+| **e3000** | | | .0304/.0348 | | .0310/.0321 | | |
+| **e4000** | | .0332/.0509 | | | .0297/.0283 | | |
+
+Structure: (1) LR has a single peak at **1e-3** — bias falls monotonically
+5e-5→1e-3, rises again by 2e-3; (2) length saturates around ~2000 effective
+epochs — e4000 runs (warmup/patience/cosine scaled along) are slightly
+*worse* at both LRs tested. The best trial (e2000 lr1e-3) ran its full budget
+without early-stopping, i.e. was still improving, but its e3000/e4000
+extensions did not beat it.
+
+**Floor: σ_NMAD ≈ 0.0291, bias ≈ 0.0258** (best trial) vs. target σ ~2×10⁻²,
+bias ~10⁻³. σ is within reach; bias is stuck ~2.6× above target. Neighboring
+trials near the peak differ by ±0.003–0.008 in bias — likely seed-level
+noise, so finer grid refinement is unlikely to close a 2.6× gap.
+
+**λ_z-dip follow-up (same day)**: removing the Phase-2 λ_z dip
+(`--lam-z-min 20`, the old model's scheme) was tested as a paired A/B at
+e2500 lr1.5e-3 — it improved both metrics at identical config
+(0.0321/0.0521 → 0.0299/0.0420), a cleanly attributable gain. Stacked onto
+the sweep peak (e2000 lr1e-3): σ_NMAD 0.0291→0.0298, bias 0.0258→**0.0244**
+(best bias of all 15 trials, but no additive transfer — the gain shrinks to
+~0.001–0.002 at the peak, within the noise band). Revised floor:
+**σ ≈ 0.029, bias ≈ 0.024**.
+
+**Bias decomposition (2026-08-04)** — where the mean-dz bias actually lives
+(`bias = np.mean(dz)` in `compute_metrics`, so it is outlier-sensitive):
+
+- **The z-separated core is essentially unbiased.** For the σ-best trial,
+  the 88.4% of test galaxies with |dz| ≤ 0.15 have mean dz = −0.0006
+  (median dz overall −0.0013). The entire +0.026 headline bias is the tail:
+  6.8% of galaxies with dz > +0.15 (mean +0.63) contribute +0.043, partially
+  cancelled by 4.8% with dz < −0.15 contributing −0.017.
+- **The dominant term is low-z→high-z catastrophic outliers**: 11.7% of
+  z_true < 0.5 galaxies (out of 957) are flung upward, contributing +0.033 —
+  more than the entire net bias. High-z bins contribute *negative* bias
+  (26–46% of z>1.5 galaxies scatter low) but hold few galaxies.
+- **The old model's bias=0.0106 is a cancellation artifact, not better
+  predictions.** Its core is systematically shifted: core mean dz = −0.0199
+  (median −0.0266), cancelling a *worse* outlier tail (+0.048 from out+,
+  8.0% rate). On core calibration the z-separated model is ~30× better;
+  on the tail it is slightly better too. Every previous "old model wins on
+  bias" comparison should be reread with this in mind — median dz or
+  core-mean dz is the honest core-calibration metric.
+- **Implication for the 10⁻³ bias target**: it will not come from core
+  tuning (already at −0.001); it requires shrinking the low-z out+ rate.
+  Suspected driver: the z-weighting — all z>3 train galaxies sit at the
+  13× weight cap (see `z_weights.png`), pushing the model to enlarge the
+  high-z prediction region in feature space, which captures ambiguous
+  low-z galaxies (Balmer/Lyman-break confusion). Testing `z_weight_cap`
+  ∈ {5, 3, 1} at the sweep peak now.
+
+**z_weight_cap trials (2026-08-04): not a lever.** At e2000 lr1e-3, bias vs
+cap: 10 (incumbent) → +0.0258, 5 → +0.0400, 3 → +0.0282, 1 → +0.0344 —
+non-monotonic, all ≥ incumbent, and the low-z out+ rate did not fall at any
+cap (11.7% → 13.2 / 10.8 / 13.8%). The low-z→high-z catastrophic outliers
+are not controlled by the training z-weighting; they look like a genuine
+6-band photometric degeneracy (Balmer↔Lyman-break confusion) that per-galaxy
+loss weights can't resolve. Remaining plausible tools for the out+ tail:
+multimodal posterior (mixture density / flow z-head — see "Remaining
+limitations"), split gradient clipping, or adopting median-dz / core-mean-dz
+as the calibration metric (already at −0.001, i.e. the 10⁻³ order).
+
+**MDN z-head + Euclid trials (2026-08-04)** — both mechanism-matched fixes
+tried, decomposed against the promoted baseline (all e2000 lr1e-3 lzmin20):
+
+| | baseline | MDN K=3 | +Euclid (no-eu init) |
+|---|---|---|---|
+| bias / median dz | +0.0244 / −0.006 | +0.0671 / +0.005 | +0.0297 / +0.001 |
+| σ_NMAD / f_cat | 0.0298 / 19.2% | 0.0298 / 17.4% | 0.0313 / **16.2%** |
+| low-z out+ rate / mean dz | 11.3% / +0.88 | 11.5% / **+1.35** | 10.6% / +0.88 |
+| high-z out− rate (z>1.5) | 32.2% | **15.0%** | 20.3% |
+
+- **MDN** (`model/photoz_mlpvae_mdn.py`, `--model-version mdn`: K=3 raw-space
+  Gaussian mixture, mixture NLL, dominant-mode point estimate, component-
+  sampled z conditioning for vae_head): *halves* the high-z out− rate and
+  gives the family-best f_cat, but the low-z fling **rate** is unchanged —
+  it's a wrong-branch *ranking* error, not a unimodal-compromise error — and
+  mode-picking makes each wrong commit land further (dz +1.35 vs +0.88), so
+  mean bias worsens. Early-stopped fast (ep 767).
+- **Euclid** (mismatch warm-start from the no-euclid synth ckpt): near-parity
+  headline (vs the old model's Euclid disaster), best f_cat trend, high-z
+  out− 32→20%, essentially perfectly calibrated core (+0.0004) — but low-z
+  out+ rate again unchanged (10.6%). The **native-init** counterpart
+  (warm-started from `mlpvae_synth_zsep_v1_euclid_gaap1p0`, synth σ_NMAD
+  0.0091 vs no-euclid 0.0185) landed at σ 0.0317 / bias +0.0329 /
+  **f_cat 15.25% (best overall)** / median −0.0006 / low-z out+ 11.2% —
+  statistically equal to the mismatch-init run (same precedent as the old
+  model: the better synth pretrain does not transfer an advantage), and the
+  low-z fling rate is unchanged in every Euclid variant.
+- **Who the flung galaxies are** (baseline, 108/957 low-z): median i=24.0 vs
+  21.0 for well-predicted low-z (≈3 mag fainter, ~10× noisier photometry;
+  all 6 bands detected; spec-z confidence *fine*, median 0.97). Faint low-z
+  dwarfs whose noisy colors admit a high-z solution — also why Euclid can't
+  help (DP1-matched Euclid photometry is near its depth limit at i≈24), and
+  why a magnitude prior would push them the *wrong* way (P(z|i=24) favors
+  high z). **Conclusion: this population is data-limited in 6-band optical
+  photometry.** Its +0.033 mean-dz contribution exceeds the entire <0.01
+  bias budget, so mean-dz bias ~10⁻² on the full sample is likely
+  unreachable for any model on this data.
+- **Quality cuts** (survey-standard, model-side): baseline σ_z cut at 70%
+  retention → σ_NMAD **0.0202** (meets the 2×10⁻² target), bias +0.0145,
+  outliers 3.8%. MDN between-mode-std cut (the right MDN flag; dominant-mode
+  σ is useless — wrong-branch commits are confident) → bias +0.0151 at 70%,
+  +0.0128 at 50%. Even at 50% retention mean bias stays >0.01; median dz is
+  ~+0.004 throughout. The 10⁻³-order target is met by median-dz on the full
+  sample, and by no mean-dz variant tried.
+
+**Status**: open. Best trial configs not yet promoted to `trained/`
+(σ-best: e2000 lr1e-3; bias-best: e2000 lr1e-3 + lam_z_min=20). Candidate
+levers still untested: split gradient clipping (trunk+z_head vs vae_head as
+separate `clip_grad_norm_` calls, so one head's spikes can't eat the other's
+budget); seed ensembling of the best config.
 
 ### Euclid bands degrade real dp1_v4 fine-tuning despite better synth pretrain (Failure 7)
 
@@ -255,7 +427,116 @@ training galaxies).
 
 ---
 
+### Failure 9 — Phase-1 `use_nll_z` gating collapses σ_z, then spikes the loss at Phase 2 (z-separated model, fixed 2026-07-30)
+
+**Symptom**: one-epoch catastrophic loss spike at the Phase 1→2 transition
+(`z_sup` 0.33 → 5551, total → 11922), recovering over ~10 epochs.
+
+**Root cause**: `train_dp1.py`/`train_synth.py` gated `use_nll_z` on
+`epoch > warmup_epochs + sigma_z_warmup`, so Phase 1 trained z with plain MSE
+only. Nothing calibrated `log_var_z`, and MSE's reparameterization noise gave
+the model incentive to shrink it toward zero for free (collapsed to
+log σ_z ≈ −4.0, σ_z ≈ 0.018, by epoch 50). When Phase 2 flipped
+`use_nll_z=True`, the `1/σ_z² ≈ 3100` factor amplified real residuals into
+the spike.
+
+**Fix**: `use_nll_z=True` hardcoded for all epochs in both scripts; dead
+`--sigma-z-warmup` flag removed. Rerun (`mlpvae_zsep_v3_lsst_gaap1p0_nllfix`):
+spike gone (σ_z smooth through the transition), σ_NMAD 0.0442 → 0.0391 —
+though bias/outliers/f_cat slightly worsened (tight-scatter/worse-tails
+pattern). Note `train.py` (non-DP1) retains the old gating with
+`SIGMA_Z_WARMUP=30` for the old model — deliberately left unchanged.
+
+---
+
+### Failure 10 — `phase2_trunk_lr_frac` obsolete for the z-separated model (removed from train_dp1.py, 2026-08-03)
+
+**Observation**: the 10× trunk-LR cut at Phase 2 was a holdover from the old
+joint-gradient model, where it protected z_pred from the freshly-unfrozen
+VAE head. The z-separated model already closes that path architecturally —
+`vae_head` reads `[h.detach(), z_pred.detach()]`, so recon/KL gradient cannot
+reach trunk/z_head regardless of LR. The cut was also stacking on top of the
+λ_z dip (a second, redundant throttle), and dropped trunk LR 10× right before
+cosine decay pulled it down anyway, leaving little step size to fix residual
+bias late in training.
+
+**Change**: `phase2_trunk_lr_frac` removed entirely from `train_dp1.py`
+(constant, flag, config field, and the Phase-2 rescale). Trunk/z_head now
+stay on one continuous cosine schedule. `train_synth.py` still has the flag
+(default 0.1).
+
+**Result** (`mlpvae_zsep_v2_lsst_gaap1p0_init_synth_lrfix`, 500 epochs):
+σ_NMAD 0.0442 → **0.0349**, outliers 13.91% → 13.15%; bias worsened
+0.0577 → 0.0689 at 500 epochs but recovered to **0.0559** in the 1000-epoch
+rerun (`..._lrfix_1000ep`, early-stopped at 603) — which also improved RMS
+0.3413 → 0.3012, making it the best saved checkpoint on σ_NMAD and bias
+simultaneously among z-separated runs.
+
+---
+
+### Failure 11 — Gradient clipping fires on 100% of batches; removing it worsens every metric (investigated 2026-08-03)
+
+**Observation**: new per-epoch LR/grad-norm instrumentation
+(`lr_and_gradnorm.png`, gnorm in the epoch log line) showed
+`clip_grad_norm_(encoder.parameters(), 2.0)` triggering on **every batch of
+every epoch** — pre-clip norms typically 50–5,000 (2–4 orders above the
+threshold), ~6×10⁷ at epoch 1, climbing again late in training as σ_z shrinks
+and the 1/σ_z² NLL factor amplifies residual gradients. The huge norm is
+present already in Phase 1 (vae_head frozen), so it is driven by the z-NLL
+term itself, not the VAE.
+
+**A/B test** (`mlpvae_zsep_v2_lsst_gaap1p0_init_synth_noclip`): removing
+clipping entirely trained stably (no NaN — Adam absorbed the epoch-1 spike)
+but worsened **all five** metrics: σ_NMAD 0.0349→0.0380, bias 0.0689→0.0896,
+outliers 13.15%→15.73%, RMS 0.3413→0.3688, f_cat 18.00%→19.21%. Unlike other
+ablations in this lineage (which trade scatter against tails), this was
+uniformly negative.
+
+**Interpretation**: at max_norm=2.0 with raw norms in the hundreds–thousands,
+clipping acts as always-on normalized-direction descent, keeping every
+batch's contribution to Adam's second-moment EMA at the same scale so
+occasional outlier batches can't poison ~1000 subsequent steps. **Conclusion:
+keep clipping at 2.0**; raising/removing it is empirically closed. The open
+follow-up is *split* clipping (see Open problems).
+
+---
+
+### Failure 12 — Clipping silently disabled by a leftover ablation edit; mislabeled 1000-epoch run (caught + fixed 2026-08-03)
+
+**Symptom**: the first "lrfix 1000-epoch" run produced f_cat=19.17% —
+pattern-matching the noclip run (19.21%), not the clipped 500-epoch run
+(18.00%).
+
+**Root cause**: the noclip ablation had been implemented by editing
+`run_epoch` directly (replacing `clip_grad_norm_` with a measure-only norm
+computation) and was never reverted, so the follow-up run trained unclipped
+while believing clipping was on.
+
+**Fix**: the mislabeled run was renamed
+`mlpvae_zsep_v2_lsst_gaap1p0_init_synth_noclip_1000ep` (σ_NMAD 0.0342, bias
+0.0701 — a valid extra noclip data point), and clipping was reinstated behind
+an explicit `--grad-clip-max-norm` flag (default 2.0; ≤0 disables but still
+measures the norm; recorded in `config.yaml`; the `lr_and_gradnorm.png`
+reference-line label reflects whether clipping was applied). The corrected
+1000-epoch clipped run is `..._lrfix_1000ep` (0.0348/0.0559). **Lesson**:
+toggle training behaviors for ablations via flags with explicit defaults,
+never by editing source in place.
+
+---
+
 ## Experiment log
+
+> **Checkpoint cleanup (2026-08-04):** all `trained/` model directories that
+> were not best on ≥1 dp1_v4 test metric were deleted; their metrics survive
+> only in the tables below. Kept: `mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20`
+> (σ_NMAD 0.0298, RMS 0.2514), `mlpvae_zsep_v4_euclid_gaap1p0_e2000_lzmin20`
+> (outliers 10.02%), `mlpvae_v2_lsst_gaap1p0` (bias 0.0106 — a core/tail
+> cancellation, see Open problems), `mlpvae_v2_euclid_gaap1p0` (f_cat 8.33%),
+> their four synth warm-start sources (`mlpvae_synth_v1_{no_,}euclid_gaap1p0`,
+> `mlpvae_synth_zsep_v1_{no_,}euclid_gaap1p0`), and
+> `mlpvae_speculator_v2_finetuned` (PZ Data Challenge artifact, out of scope).
+> Old-catalog models (`mlpvae_v1/v2/v1_mags`, `obs_v3/v5/v6`) were evaluated
+> on a different test set — their numbers were not treated as metric wins.
 
 | Model | Data | use_gaap | Synth init | Phase2 trunk LR | λ_z_min | σ_NMAD (test) |
 |-------|------|----------|------------|-----------------|---------|---------------|
@@ -271,3 +552,22 @@ training galaxies).
 | mlpvae_v4b_lsst_gaap1p0_init_synth_v1 | dp1_v4 (+Euclid) | Yes | synth_v1_euclid | **0.1 (script default)** | 2.0 | **0.0929** (0.0739 on an earlier run in the same log) |
 | mlpvae_obs_v6_gaap1p0 | dp1_v4 (+Euclid) | Yes | synth_v1_euclid | 0.02 | 2.0 | 0.1133 |
 | mlpvae_obs_v8_zambig_fixed_gaap1p0 | dp1_v4 (+Euclid) | Yes | synth_v1_euclid | 0.02 | 2.0 | 0.1146 (reverted, see Failure 8) |
+
+### z-separated model era (`--model-version new`, 2026-07-30 →)
+
+All dp1_v4, LSST-only. "clip" = `clip_grad_norm_` max-norm on encoder grads.
+Warm-start ("synth_zsep") = `mlpvae_synth_zsep_v1_no_euclid_gaap1p0/best.pt`
+(synth test σ_NMAD 0.0185).
+
+| Run (`trained/`) | Date | Epochs | LR | Warmup | Trunk-LR ×0.1 @P2 | Clip | σ_NMAD | Bias | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| mlpvae_zsep_v1_lsst | 07-30 | 500 | 1e-4 | 50 | yes | 2.0 | 0.0685 | 0.0920 | no GAAP, no warm-start |
+| mlpvae_zsep_v2_..._preLRfix_0730 | 07-30 | 500 | 1e-4 | 50 | yes | 2.0 | 0.0442 | 0.0577 | GAAP + synth_zsep warm-start |
+| mlpvae_zsep_v3_..._nllfix | 07-30 | 500 | 1e-4 | 50 | yes | 2.0 | 0.0391 | 0.0824 | NLL-z always on (Failure 9) |
+| mlpvae_zsep_v2_..._lrfix | 08-03 | 500 | 1e-4 | 50 | **no** | 2.0 | 0.0349 | 0.0689 | trunk-LR rescale removed (Failure 10) |
+| mlpvae_zsep_v2_..._noclip | 08-03 | 500 | 1e-4 | 50 | no | **off** | 0.0380 | 0.0896 | all 5 metrics worse (Failure 11) |
+| mlpvae_zsep_v2_..._noclip_1000ep | 08-03 | 1000 | 1e-4 | 50 | no | **off** | 0.0342 | 0.0701 | accidental noclip (Failure 12) |
+| mlpvae_zsep_v2_..._lrfix_1000ep | 08-03 | 1000 | 1e-4 | 50 | no | 2.0 | 0.0348 | 0.0559 | superseded by v4 promotions |
+| ~24 sweep/lever trials (scratch only) | 08-03/04 | 1500–4000 | 5e-5–3e-3 | 10% | no | 2.0 | best 0.0291 | best 0.0244 | see Open problems |
+| **mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20** | 08-04 | 2000 | 1e-3 | 200 | no | 2.0 | **0.0298** | **0.0244** | promoted trial (lam_z_min=20); best saved LSST-only |
+| **mlpvae_zsep_v4_euclid_gaap1p0_e2000_lzmin20** | 08-04 | 2000 | 1e-3 | 200 | no | 2.0 | 0.0317 | 0.0329 | +Euclid, native-init (`mlpvae_synth_zsep_v1_euclid_gaap1p0`); best f_cat 15.25%, outliers 10.02%, median dz −0.0006 |

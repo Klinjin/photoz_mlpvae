@@ -508,18 +508,28 @@ def plot_calibration(z_true, z_pred, z_std, save_path="photoz_calibration.png"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot 5 – PIT (Probability Integral Transform) histogram
+# Plot 5 – QQ + PIT calibration plot (Schmidt et al. 2020, DC1 style)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_pit(z_true, z_pred, z_std=None, z_samples=None,
-             save_path="photoz_pit.png", title="", n_bins=100):
-    """PIT histogram for probabilistic photo-z predictions.
+             save_path="photoz_pit.png", title="", n_bins=100,
+             n_quants=101):
+    """QQ + PIT calibration plot for probabilistic photo-z predictions.
 
-    A perfectly calibrated model produces a uniform PIT distribution.
-    The red horizontal line marks the ideal count level (N / n_bins).
+    PIT_i = ∫₀^{z_true,i} p_i(z) dz — the quantile of the true redshift
+    within each galaxy's photo-z posterior.  A perfectly calibrated model
+    produces PIT values uniform on [0, 1].
 
-    Spikes near 0 or 1 indicate over-confidence (true z lies outside the
-    predicted interval more often than expected).
+    Top panel: PIT histogram (blue bars, right axis "Number") with the
+    ideal uniform level (solid black line, N / n_bins), overlaid with the
+    QQ curve (red, left axis): Q_data — the quantiles of the photo-z PIT
+    distribution — against Q_theory — the corresponding quantiles of the
+    calibrated (uniform) reference built from the true redshifts.  A
+    calibrated model traces the dashed diagonal.
+
+    Bottom panel: ΔQ = Q_data − Q_theory.  Excursions below zero at small
+    Q_theory (or above zero near 1) reflect the over-confidence spikes at
+    PIT ≈ 0 / 1.
 
     Parameters
     ----------
@@ -532,8 +542,9 @@ def plot_pit(z_true, z_pred, z_std=None, z_samples=None,
                 stochastic forward passes).  When provided the PIT is
                 computed empirically: PIT_i = fraction of samples < z_true_i.
     save_path : output file path.
-    title     : plot title string.
+    title     : label shown in the boxed legend (e.g. the model name).
     n_bins    : number of histogram bins (default 100).
+    n_quants  : number of quantile points for the QQ curve (default 101).
     """
     if z_samples is not None:
         mask = np.isfinite(z_true) & np.isfinite(z_pred)
@@ -549,19 +560,54 @@ def plot_pit(z_true, z_pred, z_std=None, z_samples=None,
         z_std  = z_std[mask]
         pit = ndtr((z_true - z_pred) / z_std)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(pit, bins=n_bins, range=(0.0, 1.0), color="blue", edgecolor="none")
+    q_theory = np.linspace(0.0, 1.0, n_quants)
+    q_data   = np.quantile(pit, q_theory)
+    delta_q  = q_data - q_theory
+
+    fig = plt.figure(figsize=(5.0, 6.2))
+    gs  = fig.add_gridspec(2, 1, height_ratios=[3.2, 1.0], hspace=0.30)
+
+    # ── Top panel: QQ curve (left axis) + PIT histogram (right axis) ──────
+    ax_q = fig.add_subplot(gs[0])
+    ax_h = ax_q.twinx()
+
+    ax_h.hist(pit, bins=n_bins, range=(0.0, 1.0),
+              color="#5c9dc7", edgecolor="white", lw=0.2)
     ideal = len(pit) / n_bins
-    ax.axhline(ideal, color="red", lw=1.5)
-    ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("PIT value", fontsize=12)
-    ax.set_ylabel("Number", fontsize=12)
+    ax_h.axhline(ideal, color="black", lw=1.2)
+    ax_h.set_ylabel("Number", fontsize=12)
+    ax_h.set_ylim(bottom=0)
+
+    ax_q.plot([0, 1], [0, 1], "k--", lw=1.2)
+    ax_q.plot(q_theory, q_data, color="red", lw=2.5)
+    ax_q.set_xlim(0.0, 1.0)
+    ax_q.set_ylim(0.0, 1.0)
+    ax_q.set_ylabel(r"$Q_{data}$", fontsize=12)
+    # Draw the QQ axes above the histogram axes.
+    ax_q.set_zorder(ax_h.get_zorder() + 1)
+    ax_q.patch.set_visible(False)
     if title:
-        ax.set_title(title, fontsize=12)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
+        ax_q.text(0.05, 0.96, title, transform=ax_q.transAxes,
+                  ha="left", va="top", fontsize=11,
+                  bbox=dict(boxstyle="square,pad=0.4", facecolor="white",
+                            edgecolor="black", lw=0.8))
+
+    # ── Bottom panel: ΔQ = Q_data − Q_theory ──────────────────────────────
+    ax_d = fig.add_subplot(gs[1])
+    ax_d.axhline(0.0, color="black", ls="--", lw=1.2)
+    ax_d.plot(q_theory, delta_q, color="red", lw=2.5)
+    ax_d.set_xlim(0.0, 1.0)
+    # ±0.12 as in Schmidt et al. (2020); widen symmetrically if ΔQ exceeds it.
+    dq_lim = max(0.12, 1.08 * float(np.max(np.abs(delta_q))))
+    ax_d.set_ylim(-dq_lim, dq_lim)
+    if dq_lim <= 0.12:
+        ax_d.set_yticks([-0.1, 0.0, 0.1])
+    ax_d.set_xlabel(r"$Q_{theory}$ / PIT Value", fontsize=12)
+    ax_d.set_ylabel(r"$\Delta Q$", fontsize=12)
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved PIT histogram → {save_path}")
+    print(f"Saved QQ/PIT plot → {save_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

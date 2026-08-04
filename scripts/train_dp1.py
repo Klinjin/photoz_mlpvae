@@ -95,7 +95,7 @@ MAX_EPOCHS    = 500
 BATCH_SIZE    = 256
 LR            = 1e-4
 PATIENCE      = MAX_EPOCHS//5
-WARMUP_EPOCHS = 50
+WARMUP_FRAC   = 0.10   # Phase 1 length as a fraction of total epochs
 RECON_RAMP    = 50
 BETA_EPOCHS   = 50
 SEED          = 42
@@ -110,8 +110,8 @@ SIGMA_FLOOR  = 0.3
 N_ZBINS_WEIGHT = 25
 Z_WEIGHT_CAP  = 10.0        # cap z-weights at this multiple of mean (prevent 277× extremes)
 
-PHASE2_TRUNK_LR_FRAC = 0.1  # no LR scaling at Phase 2 (v1 scheme)
 PHASE2_VAE_LR_FRAC   = 1.0  # vae_head at full LR (v1 scheme)
+GRAD_NORM_REF        = 2.0  # former clip threshold; kept only as a reference line for plots
 NMAD_AVG_WINDOW      = 5    # rolling-average window for checkpoint criterion (smooths 677-gal noise)
 TRAIN_PLAN          = "always sigma_NMAD for best model"  # "phase1_warmup_then_phase2" or "joint_training"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,10 +175,15 @@ def plot_curves(history: dict, path: str, events: list = None):
             ax.axvline(x, ls=":", color=color, lw=1.4,
                        label=f"ep {x}: {lbl}" if label_in_legend else None)
 
+    def _has_data(key):
+        vals = history.get(key)
+        return bool(vals) and np.any(np.isfinite(np.asarray(vals, dtype=float)))
+
     # ── Top: total loss ──────────────────────────────────────────────────────
     k, lab = "total", labels[0]
-    if f"tr_{k}" in history and history[f"tr_{k}"]:
+    if _has_data(f"tr_{k}"):
         ax_top.plot(history[f"tr_{k}"],  label="train")
+    if _has_data(f"val_{k}"):
         ax_top.plot(history[f"val_{k}"], label="val", ls="--")
     _draw_events(ax_top, label_in_legend=True)
     ax_top.set_title(lab, fontsize=12)
@@ -187,8 +192,9 @@ def plot_curves(history: dict, path: str, events: list = None):
 
     # ── Bottom: breakdown losses ─────────────────────────────────────────────
     for ax, k, lab in zip(ax_subs, keys[1:], labels[1:]):
-        if f"tr_{k}" in history and history[f"tr_{k}"]:
+        if _has_data(f"tr_{k}"):
             ax.plot(history[f"tr_{k}"],  label="train")
+        if _has_data(f"val_{k}"):
             ax.plot(history[f"val_{k}"], label="val", ls="--")
         _draw_events(ax, label_in_legend=False)
         ax.set_title(lab, fontsize=10)
@@ -200,18 +206,105 @@ def plot_curves(history: dict, path: str, events: list = None):
     print(f"  Curves → {path}")
 
 
+def plot_lr_and_gradnorm(history: dict, path: str, grad_norm_ref: float = GRAD_NORM_REF,
+                          clip_applied: bool = True, events: list = None):
+    """
+    Two stacked panels sharing the epoch axis: LR (log scale, per param group)
+    on top, training gradient norm (mean+max) on the bottom with a dotted
+    reference line at the clip threshold actually used for this run (or, if
+    clipping was disabled, at the value it would have used for comparison).
+    """
+    BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
+    MUTED = "#898781"
+
+    fig, (ax_lr, ax_gn) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
+                                        gridspec_kw={"height_ratios": [1, 1.1], "hspace": 0.12})
+
+    epochs = list(range(1, len(history["lr_trunk"]) + 1))
+    ax_lr.plot(epochs, history["lr_trunk"], color=BLUE, lw=2, label="trunk / z_head / σ_z_head")
+    vae_epochs = [e for e, v in zip(epochs, history["lr_vae"]) if v is not None]
+    vae_vals   = [v for v in history["lr_vae"] if v is not None]
+    if vae_vals:
+        ax_lr.plot(vae_epochs, vae_vals, color=ORANGE, lw=2, label="vae_head")
+    ax_lr.set_yscale("log")
+    ax_lr.set_ylabel("Learning rate")
+    ax_lr.legend(fontsize=8, frameon=False, loc="upper right")
+
+    ax_gn.plot(epochs, history["grad_norm_mean"], color=AQUA, lw=2, label="mean (per-batch)")
+    ax_gn.plot(epochs, history["grad_norm_max"], color=AQUA, lw=1, alpha=0.5, ls="--",
+               label="max (per-batch)")
+    ref_label = (f"clip threshold ({grad_norm_ref:g})" if clip_applied else
+                 f"clip threshold ({grad_norm_ref:g}, not applied here)")
+    ax_gn.axhline(grad_norm_ref, color=MUTED, lw=1, ls=":", label=ref_label)
+    ax_gn.set_yscale("log")  # norms span many orders of magnitude (esp. epoch 1)
+    ax_gn.set_ylabel("Grad norm" + ("" if clip_applied else " (unclipped)"))
+    ax_gn.set_xlabel("epoch")
+    ax_gn.legend(fontsize=8, frameon=False, loc="upper right")
+
+    if events:
+        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        for ax in (ax_lr, ax_gn):
+            for i, (x, _) in enumerate(events):
+                ax.axvline(x, ls=":", color=prop_cycle[(i + 2) % len(prop_cycle)], lw=1.2)
+
+    fig.suptitle("Learning rate & gradient norm", fontsize=11, x=0.01, ha="left")
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  LR/grad-norm → {path}")
+
+
+def plot_z_weights(z_tr, zw_raw, zw_capped, cap, path,
+                   n_bins=N_ZBINS_WEIGHT, z_max=5.5):
+    """
+    Two stacked panels sharing the z axis: training-set redshift histogram
+    (the same binning compute_z_weights uses) on top, per-galaxy loss weight
+    vs z_spec on the bottom — raw inverse-frequency weights and the
+    capped+renormalized weights actually used, with the cap level marked.
+    """
+    BLUE, ORANGE = "#2a78d6", "#eb6834"
+    MUTED = "#898781"
+
+    fig, (ax_h, ax_w) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True,
+                                      gridspec_kw={"height_ratios": [1, 1.2], "hspace": 0.12})
+
+    edges = np.linspace(0.0, z_max, n_bins + 1)
+    ax_h.hist(z_tr, bins=edges, color=BLUE, alpha=0.85)
+    ax_h.set_ylabel("N train galaxies")
+    ax_h.set_yscale("log")
+    ax_h.set_title(f"z-weights (n_bins={n_bins}, cap={cap:g}× mean)",
+                   fontsize=11, loc="left")
+
+    order = np.argsort(z_tr)
+    ax_w.plot(z_tr[order], zw_raw[order], color=MUTED, lw=1, alpha=0.6,
+              label="raw inverse-frequency")
+    ax_w.plot(z_tr[order], zw_capped[order], color=ORANGE, lw=2,
+              label="capped + renormalized (used)")
+    if cap and cap > 0:
+        ax_w.axhline(cap, color=MUTED, lw=1, ls=":", label=f"cap ({cap:g})")
+    ax_w.set_yscale("log")
+    ax_w.set_xlabel("z_spec")
+    ax_w.set_ylabel("loss weight")
+    ax_w.legend(fontsize=8, frameon=False, loc="upper left")
+
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  z-weights → {path}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, device, opt=None,
               lam_z=LAM_Z, lam_r=LAM_R, beta=0.0,
-              sigma_floor=SIGMA_FLOOR, use_nll_z=True):
+              sigma_floor=SIGMA_FLOOR, use_nll_z=True,
+              grad_clip_max_norm=GRAD_NORM_REF):
     is_train = (opt is not None)
     model.train() if is_train else model.eval()
 
     totals = {k: 0.0 for k in ("total", "z_sup", "recon", "kl", "log_sigma_z")}
     n = 0
+    grad_norms = []  # pre-clip total norm, one entry per training batch
 
     ctx = torch.enable_grad if is_train else torch.no_grad
 
@@ -237,7 +330,14 @@ def run_epoch(model, loader, device, opt=None,
 
             if is_train:
                 losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 2.0)
+                if grad_clip_max_norm and grad_clip_max_norm > 0:
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.encoder.parameters(), grad_clip_max_norm)
+                else:
+                    grads = [p.grad.detach() for p in model.encoder.parameters()
+                             if p.grad is not None]
+                    total_norm = torch.norm(torch.stack([g.norm(2) for g in grads]), 2)
+                grad_norms.append(total_norm.item())
                 opt.step()
 
             bs = len(x_b)
@@ -245,7 +345,15 @@ def run_epoch(model, loader, device, opt=None,
                 totals[k] += losses[k].item() * bs
             n += bs
 
-    return {k: v / n for k, v in totals.items()}
+    grad_norm_stats = None
+    if is_train and grad_norms:
+        gn = np.array(grad_norms)
+        grad_norm_stats = dict(
+            mean=float(gn.mean()),
+            max=float(gn.max()),
+        )
+
+    return {k: v / n for k, v in totals.items()}, grad_norm_stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,11 +378,13 @@ def main():
     parser.add_argument("--lam-z-restore",      type=int,   default=LAM_Z_RESTORE,
                         help="Epochs to ramp λ_z back to full after β stabilizes")
     parser.add_argument("--sigma-floor",        type=float, default=SIGMA_FLOOR)
-    parser.add_argument("--warmup-epochs",      type=int,   default=WARMUP_EPOCHS)
-    parser.add_argument("--phase2-trunk-lr-frac", type=float, default=PHASE2_TRUNK_LR_FRAC,
-                        help="LR multiplier for trunk/z_head at Phase 2 start")
+    parser.add_argument("--warmup-epochs",      type=int,   default=None,
+                        help="Phase 1 length in epochs (default: 10%% of --epochs)")
     parser.add_argument("--phase2-vae-lr-frac",   type=float, default=PHASE2_VAE_LR_FRAC,
                         help="LR multiplier for vae_head at Phase 2 start")
+    parser.add_argument("--grad-clip-max-norm", type=float, default=GRAD_NORM_REF,
+                        help="Gradient-norm clip threshold for model.encoder.parameters() "
+                             "(<=0 disables clipping; norm is still measured either way)")
     parser.add_argument("--z-weight-cap",       type=float, default=Z_WEIGHT_CAP,
                         help="Cap z-weights at this multiple of mean (0 = no cap)")
     parser.add_argument("--init-from",          default=None,
@@ -286,17 +396,27 @@ def main():
                         help="Include Euclid bands (default: LSST-only)")
     parser.add_argument("--use-gaap",   action="store_true",
                         help="Use GAAP 1.0-arcsec aperture mags for LSST bands instead of cModel")
-    parser.add_argument("--model-version", choices=["old", "new"], default="old",
+    parser.add_argument("--model-version", choices=["old", "new", "mdn"], default="old",
                         help="'old' = 3-head photoz_mlpvae_old (16-dim joint VAE); "
                              "'new' = photoz_mlpvae z-separated design (dedicated "
-                             "z MLP head, 15-param VAE head conditioned on z)")
+                             "z MLP head, 15-param VAE head conditioned on z); "
+                             "'mdn' = z-separated with mixture-density z head "
+                             "(K=3, dominant-mode point estimate)")
+    parser.add_argument("--out-base",   default=OUT_BASE,
+                        help="Base directory for the run's output folder")
+    parser.add_argument("--trial",      action="store_true",
+                        help="Comparison-trial mode: train + print test metrics only, "
+                             "skip all figures/diagnostics")
     args = parser.parse_args()
+
+    if args.warmup_epochs is None:
+        args.warmup_epochs = max(1, round(WARMUP_FRAC * args.epochs))
 
     use_colors = not args.no_colors
     use_euclid = args.euclid
     use_gaap   = args.use_gaap
 
-    out_dir = os.path.join(OUT_BASE, args.model_name)
+    out_dir = os.path.join(args.out_base, args.model_name)
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Logging ───────────────────────────────────────────────────────────
@@ -326,8 +446,8 @@ def main():
         lam_r               = args.lam_r,
         sigma_floor         = args.sigma_floor,
         warmup_epochs       = args.warmup_epochs,
-        phase2_trunk_lr_frac = args.phase2_trunk_lr_frac,
         phase2_vae_lr_frac  = args.phase2_vae_lr_frac,
+        grad_clip_max_norm  = args.grad_clip_max_norm,
         z_weight_cap        = args.z_weight_cap,
         init_from           = args.init_from,
         beta_max            = BETA_MAX,
@@ -368,12 +488,16 @@ def main():
         build_features(te_df,  use_colors=use_colors, use_euclid=use_euclid,
                        use_gaap=use_gaap, scaler=scaler, col_medians=col_med)
 
-    zw = compute_z_weights(z_tr)
+    zw_raw = compute_z_weights(z_tr)
+    zw     = zw_raw
     if args.z_weight_cap > 0:
-        zw = np.clip(zw, None, args.z_weight_cap)
+        zw = np.clip(zw_raw, None, args.z_weight_cap)
         zw = (zw / zw.mean()).astype(np.float32)
     print(f"z-weights (train): min={zw.min():.3f}  max={zw.max():.3f}  "
           f"mean={zw.mean():.3f}  (cap={args.z_weight_cap:.0f}x)")
+    if not args.trial:
+        plot_z_weights(z_tr, zw_raw, zw, args.z_weight_cap,
+                       os.path.join(out_dir, "z_weights.png"))
 
     tr_loader  = make_dataloader(X_tr,  mags_tr,  errs_tr,  mask_tr,  z_tr,
                                  zw, args.batch, shuffle=True)
@@ -386,6 +510,8 @@ def main():
     # ── Model ─────────────────────────────────────────────────────────────
     if args.model_version == "new":
         from photoz_mlpvae.model.photoz_mlpvae import PhotozMLPVAE
+    elif args.model_version == "mdn":
+        from photoz_mlpvae.model.photoz_mlpvae_mdn import PhotozMLPVAE
     else:
         from photoz_mlpvae.model.photoz_mlpvae_old import PhotozMLPVAE
 
@@ -428,6 +554,7 @@ def main():
         "tr_total", "tr_z_sup", "tr_recon", "tr_kl", "tr_log_sigma_z",
         "val_total", "val_z_sup", "val_recon", "val_kl", "val_log_sigma_z",
         "val_sigma_nmad", "beta",
+        "lr_trunk", "lr_vae", "grad_norm_mean", "grad_norm_max",
     ]}
 
     print(f"Training for up to {args.epochs} epochs\n")
@@ -438,13 +565,13 @@ def main():
         if epoch == args.warmup_epochs + 1 and not phase2_started:
             print(f"\n── Phase 2: joint fine-tuning "
                   f"(epoch {epoch}, vae_head unfrozen, "
-                  f"trunk lr ×{args.phase2_trunk_lr_frac}, "
+                  f"trunk/z_head lr unchanged (cosine continues), "
                   f"vae lr ×{args.phase2_vae_lr_frac}) ──\n")
             model.encoder.unfreeze_vae_head()
-            # Scale down existing trunk/z_head/sigma_z_head LR (preserve Adam momentum).
-            for pg in opt.param_groups:
-                pg["lr"] *= args.phase2_trunk_lr_frac
-            # Add vae_head as new param group with higher LR (learns from scratch).
+            # trunk/z_head/sigma_z_head LR is left as-is (no rescale) —
+            # vae_head's recon/KL gradient never reaches them (h.detach()/
+            # z_pred.detach() in the encoder), so there is nothing to protect
+            # them from here; only add vae_head as a new param group.
             opt.add_param_group({
                 "params":       list(model.encoder.vae_head.parameters()),
                 "lr":           args.lr * args.phase2_vae_lr_frac,
@@ -479,13 +606,17 @@ def main():
         else:
             lam_z_eff = args.lam_z
 
+        lr_trunk = opt.param_groups[0]["lr"]
+        lr_vae   = opt.param_groups[1]["lr"] if len(opt.param_groups) > 1 else None
+
         t0 = time.time()
 
-        tr_loss  = run_epoch(model, tr_loader,  args.device, opt=opt,
+        tr_loss, tr_grad_stats = run_epoch(model, tr_loader,  args.device, opt=opt,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
-                             use_nll_z=True)
-        val_loss = run_epoch(model, val_loader, args.device, opt=None,
+                             use_nll_z=True,
+                             grad_clip_max_norm=args.grad_clip_max_norm)
+        val_loss, _ = run_epoch(model, val_loader, args.device, opt=None,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
                              sigma_floor=args.sigma_floor,
                              use_nll_z=True)
@@ -507,6 +638,10 @@ def main():
             history[f"val_{k}"].append(val_loss[k])
         history["val_sigma_nmad"].append(nmad)
         history["beta"].append(beta)
+        history["lr_trunk"].append(lr_trunk)
+        history["lr_vae"].append(lr_vae)
+        history["grad_norm_mean"].append(tr_grad_stats["mean"])
+        history["grad_norm_max"].append(tr_grad_stats["max"])
 
         # Rolling-average σ_NMAD: smooths per-epoch noise from small val set (677 gal).
         nmad_window.append(nmad)
@@ -514,12 +649,15 @@ def main():
             nmad_window.pop(0)
         nmad_avg = float(np.mean(nmad_window))
 
+        vae_lr_str = f"{lr_vae:.1e}" if lr_vae is not None else "-"
         print(f"Ep {epoch:3d}/{args.epochs}  "
               f"tr={tr_loss['total']:.4f}  val={val_loss['total']:.4f}  "
               f"(z={val_loss['z_sup']:.4f} r={val_loss['recon']:.4f} "
               f"kl={val_loss['kl']:.4f})  "
               f"σ_NMAD={nmad:.4f}(avg={nmad_avg:.4f})  σ_z={val_loss['log_sigma_z']:.3f}  "
-              f"β={beta:.3f}  λ_z={lam_z_eff:.1f}  lam_r={lam_r_eff:.2f}  t={dt:.1f}s")
+              f"β={beta:.3f}  λ_z={lam_z_eff:.1f}  lam_r={lam_r_eff:.2f}  "
+              f"lr={lr_trunk:.1e}/{vae_lr_str}  "
+              f"gnorm={tr_grad_stats['mean']:.2f}/{tr_grad_stats['max']:.2f}  t={dt:.1f}s")
 
         if np.isnan(tr_loss["total"]) or np.isnan(val_loss["total"]):
             print(f"  NaN detected at epoch {epoch} — stopping.")
@@ -571,80 +709,94 @@ def main():
     }).to_csv(pred_path, index=False)
     print(f"  Predictions → {pred_path}")
 
-    # ── Failure-case diagnostics ──────────────────────────────────────────
-    _targets = [
-        (0.5, 0.5, "good_lowz"),
-        (3.5, 3.5, "good_highz"),
-        (0.5, 1.5, "mild_overest"),
-        (0.5, 3.0, "severe_overest"),
-        (3.5, 2.5, "mild_underest"),
-        (3.5, 1.0, "severe_underest"),
-    ]
-    sel_idx = []
-    for zt, zp, _ in _targets:
-        score = np.abs(z_te - zt) + np.abs(z_pred_te - zp)
-        sel_idx.append(int(np.argmin(score)))
+    # ── Diagnostics + figures (skipped entirely in --trial mode) ──────────
+    if args.trial:
+        print("\nTrial mode: skipping diagnostics and figures.")
+    else:
+        _targets = [
+            (0.5, 0.5, "good_lowz"),
+            (3.5, 3.5, "good_highz"),
+            (0.5, 1.5, "mild_overest"),
+            (0.5, 3.0, "severe_overest"),
+            (3.5, 2.5, "mild_underest"),
+            (3.5, 1.0, "severe_underest"),
+        ]
+        sel_idx = []
+        for zt, zp, _ in _targets:
+            score = np.abs(z_te - zt) + np.abs(z_pred_te - zp)
+            sel_idx.append(int(np.argmin(score)))
 
-    sel_labels = [lbl for _, _, lbl in _targets]
-    sel_z_true = z_te[sel_idx]
-    sel_z_pred = z_pred_te[sel_idx]
-    sel_X      = X_te[sel_idx]
-    sel_mags   = mags_te[sel_idx]
-    sel_errs   = errs_te[sel_idx]
-    sel_mask   = mask_te[sel_idx]
+        sel_labels = [lbl for _, _, lbl in _targets]
+        sel_z_true = z_te[sel_idx]
+        sel_z_pred = z_pred_te[sel_idx]
+        sel_X      = X_te[sel_idx]
+        sel_mags   = mags_te[sel_idx]
+        sel_errs   = errs_te[sel_idx]
+        sel_mask   = mask_te[sel_idx]
 
-    print("\n── Failure-case diagnostics ──")
-    for lbl, zt, zp in zip(sel_labels, sel_z_true, sel_z_pred):
-        print(f"  {lbl:<15s}  z_true={zt:.3f}  z_pred={zp:.3f}")
+        print("\n── Failure-case diagnostics ──")
+        for lbl, zt, zp in zip(sel_labels, sel_z_true, sel_z_pred):
+            print(f"  {lbl:<15s}  z_true={zt:.3f}  z_pred={zp:.3f}")
 
-    plot_corner_posteriors(
-        model, sel_X, sel_z_true, sel_z_pred,
-        sel_labels, args.device,
-        os.path.join(out_dir, "corner"),
-        n_samples=2000,
-    )
-    plot_sed_reconstructions(
-        model, sel_X, sel_mags, sel_errs, sel_mask,
-        sel_z_true, sel_z_pred, sel_labels,
-        args.device,
-        os.path.join(out_dir, "test_sed_reconstructions.png"),
-    )
+        plot_corner_posteriors(
+            model, sel_X, sel_z_true, sel_z_pred,
+            sel_labels, args.device,
+            os.path.join(out_dir, "corner"),
+            n_samples=2000,
+        )
+        plot_sed_reconstructions(
+            model, sel_X, sel_mags, sel_errs, sel_mask,
+            sel_z_true, sel_z_pred, sel_labels,
+            args.device,
+            os.path.join(out_dir, "test_sed_reconstructions.png"),
+        )
 
-    # ── Figures ───────────────────────────────────────────────────────────
-    plot_scatter(z_te, z_pred_te,
-                 os.path.join(out_dir, "test_scatter.png"),
-                 title=f"{args.model_name}  test  σ_NMAD={nmad_te:.3f}")
-    plot_redshift_hist(z_te, z_pred_te,
-                       os.path.join(out_dir, "test_zdist.png"))
-    plot_metrics_vs_zpred(z_te, z_pred_te,
-                          os.path.join(out_dir, "test_metrics_vs_z.png"))
-    events = [
-        (args.warmup_epochs,
-         "Phase 2: VAE unfrozen, λ_z drops, λ_r & β begin"),
-        (args.warmup_epochs + RECON_RAMP,
-         "λ_r & β fully on, λ_z restoring"),
-        (args.warmup_epochs + BETA_EPOCHS + args.lam_z_restore,
-         "λ_z restored"),
-    ]
-    plot_curves(history, os.path.join(out_dir, "train_curves.png"), events=events)
-    plot_metrics_paper_style(z_te, z_pred_te, args.model_name,
-                             os.path.join(out_dir, "test_metrics_paper_style.png"))
-    plot_pit(z_te, z_pred_te, z_samples=z_samples_te,
-             save_path=os.path.join(out_dir, "test_pit.png"),
-             title=args.model_name)
+        # ── Figures ───────────────────────────────────────────────────────
+        plot_scatter(z_te, z_pred_te,
+                     os.path.join(out_dir, "test_scatter.png"),
+                     title=f"{args.model_name}  test  σ_NMAD={nmad_te:.3f}")
+        plot_redshift_hist(z_te, z_pred_te,
+                           os.path.join(out_dir, "test_zdist.png"))
+        plot_metrics_vs_zpred(z_te, z_pred_te,
+                              os.path.join(out_dir, "test_metrics_vs_z.png"))
+        if args.lam_z_min == args.lam_z:
+            _lz_drop    = f"λ_z stays {args.lam_z:g} (no dip)"
+            _lz_restore = f"λ_z flat at {args.lam_z:g}"
+        else:
+            _lz_drop    = f"λ_z {args.lam_z:g}→{args.lam_z_min:g}"
+            _lz_restore = f"λ_z restored {args.lam_z_min:g}→{args.lam_z:g}"
+        events = [
+            (args.warmup_epochs,
+             f"Phase 2: VAE unfrozen; {_lz_drop}; "
+             f"λ_r 0→{args.lam_r:g} & β 0→{BETA_MAX:g} over {RECON_RAMP} ep"),
+            (args.warmup_epochs + RECON_RAMP,
+             f"λ_r={args.lam_r:g}, β={BETA_MAX:g} fully on"),
+            (args.warmup_epochs + BETA_EPOCHS + args.lam_z_restore,
+             _lz_restore),
+        ]
+        plot_curves(history, os.path.join(out_dir, "train_curves.png"), events=events)
+        plot_lr_and_gradnorm(history, os.path.join(out_dir, "lr_and_gradnorm.png"),
+                             grad_norm_ref=(args.grad_clip_max_norm if args.grad_clip_max_norm > 0
+                                            else GRAD_NORM_REF),
+                             clip_applied=(args.grad_clip_max_norm > 0), events=events)
+        plot_metrics_paper_style(z_te, z_pred_te, args.model_name,
+                                 os.path.join(out_dir, "test_metrics_paper_style.png"))
+        plot_pit(z_te, z_pred_te, z_samples=z_samples_te,
+                 save_path=os.path.join(out_dir, "test_pit.png"),
+                 title=args.model_name)
 
-    # ── Paper-style figures (density scatter + binned metrics) ────────────
-    plot_scatter_density(z_te, z_pred_te,
-                         os.path.join(out_dir, "dp1_v4_test_scatter.png"))
-    plot_metrics_binned_3sig(z_te, dz_te,
-                              bins=np.arange(0.0, 3.2, 0.2),
-                              xlabel=r"$z_{\rm spec}$",
-                              save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_z.png"))
-    _ref_mag_col = GAAP_REF_MAG if use_gaap else REF_MAG
-    plot_metrics_binned_3sig(te_df[_ref_mag_col].values, dz_te,
-                              bins=np.arange(18.0, 25.5, 0.5),
-                              xlabel="Magnitude",
-                              save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_mag.png"))
+        # ── Paper-style figures (density scatter + binned metrics) ────────
+        plot_scatter_density(z_te, z_pred_te,
+                             os.path.join(out_dir, "dp1_v4_test_scatter.png"))
+        plot_metrics_binned_3sig(z_te, dz_te,
+                                  bins=np.arange(0.0, 3.2, 0.2),
+                                  xlabel=r"$z_{\rm spec}$",
+                                  save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_z.png"))
+        _ref_mag_col = GAAP_REF_MAG if use_gaap else REF_MAG
+        plot_metrics_binned_3sig(te_df[_ref_mag_col].values, dz_te,
+                                  bins=np.arange(18.0, 25.5, 0.5),
+                                  xlabel="Magnitude",
+                                  save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_mag.png"))
 
     print(f"\nDone. Best avg σ_NMAD={best_nmad_avg:.4f}")
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] Training finished")
