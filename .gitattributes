@@ -1,1 +1,1 @@
-submission_tarballs/*.tgz filter=lfs diff=lfs merge=lfs -text
+pz_challenge_submission/*.tgz filter=lfs diff=lfs merge=lfs -text
