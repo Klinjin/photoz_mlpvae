@@ -34,8 +34,8 @@ Architecture
 Redshift latent (mimics photoz_vae.py's treatment of zred exactly, just
 isolated to its own 1-dim Gaussian instead of column 0 of a 16-dim one):
   z_raw ~ N(mu_z, exp(log_var_z))            reparameterized sample
-  z_pred = sigmoid(z_raw) × 5.5               physical redshift
-  σ_z_phys = delta-method push-forward of σ_z_raw through sigmoid(·)×5.5
+  z_pred = sigmoid(z_raw) × _ZRED_MAX_SPEC    physical redshift
+  σ_z_phys = delta-method push-forward of σ_z_raw through sigmoid(·)×_ZRED_MAX_SPEC
              (see `_zred_sigma_phys`) — no separate sigma head; log_var_z
              plays the same role here that log_var[:,0] plays in PhotozVAE.
   The supervised NLL is evaluated at z_pred (the sample), for the same
@@ -77,18 +77,20 @@ Gradient flow
   redshift, never the other way around.
 
 SPS parameter ordering in theta_full (16 dims) — identical to PhotozVAE,
-zred transform identical, 15-param transforms identical (just reindexed):
-  0   zred               sigmoid(·) × 5.5           [0,   5.5]
-  1   logmass            sigmoid(·) × 5.5 + 7.0     [7,   12.5]
-  2   logzsol            tanh(·) × 1.085 − 0.895    [−1.98, 0.19]
-  3   dust2              sigmoid(·) × 4.0           [0,   4.0]
-  4   dust1_fraction     sigmoid(·) × 2.0           [0,   2.0]
-  5   dust_index         tanh(·) × 0.7 − 0.3        [−1.0, 0.4]
-  6   gas_logz           tanh(·) × 1.25 − 0.75      [−2.0, 0.5]
-  7   fagn               10^(sigmoid(·)×5.477 − 5)  [1e-5, ~3]
-  8   agn_tau            10^(sigmoid(·)×1.477+0.699)[5,   150]
-  9   igm_scale          sigmoid(·) × 2.0           [0,   2.0]
-  10-15 logsfr_ratios_0..5  tanh(·) × 5.0           [−5,  5]
+zred transform identical, 15-param transforms reindexed (ranges widened past
+the original synthetic-SED-generation prior 2026-08-12, dp2_v2 -- see
+constrain_params_15's own comment for the old->new table):
+  0   zred               sigmoid(·) × _ZRED_MAX_SPEC [0,  _ZRED_MAX_SPEC] (8.5)
+  1   logmass            sigmoid(·) × 6.5 + 6.5     [6.5, 13.0]
+  2   logzsol            tanh(·) × 1.25 − 0.95      [−2.2, 0.3]
+  3   dust2              sigmoid(·) × 5.0           [0,   5.0]
+  4   dust1_fraction     sigmoid(·) × 2.5           [0,   2.5]
+  5   dust_index         tanh(·) × 0.85 − 0.35      [−1.2, 0.5]
+  6   gas_logz           tanh(·) × 1.4 − 0.8        [−2.2, 0.6]
+  7   fagn               10^(sigmoid(·)×6.0 − 5)    [1e-5, ~10]
+  8   agn_tau            10^(sigmoid(·)×1.7+0.602)  [~4,  ~200]
+  9   igm_scale          sigmoid(·) × 2.5           [0,   2.5]
+  10-15 logsfr_ratios_0..5  tanh(·) × 6.0           [−6,  6]
 
 Usage
 -----
@@ -138,18 +140,61 @@ ZRED_IDX_FULL    = 0   # column index in theta_full
 LOGMASS_IDX_FULL = 1   # column index in theta_full
 LOGZSOL_IDX_FULL = 2   # column index in theta_full
 
-# Speculator is trained on zred ∈ [0, 5.5]; clamp decoder input to this range
-_ZRED_MAX_SPEC = 6.5
+# Speculator is trained on zred ∈ [0, 5.5]; decode() clamps its decoder input
+# to this range regardless. Raised from 6.5 -> 8.5 (2026-08-11, DP2) so z_pred
+# has headroom above DP2's highest test-set spec-z (~8.3): with the old 6.5
+# cap, a galaxy at z_spec=8.275 is an unreachable target, so training keeps
+# pushing mu_z toward +inf trying to get closer, saturating sigmoid(mu_z)->1
+# and collapsing the _zred_sigma_phys delta-method Jacobian (~s(1-s)) toward
+# zero independent of the log_var_z clamp -- which is what reproduced the
+# same 1/σ_z² NLL blowup (~816,871) that caused the epoch-104 NaN, even after
+# that clamp was added. Extrapolating the frozen speculator decoder further
+# past its own [0,5.5] training range for these galaxies is an accepted
+# tradeoff: it only affects vae_head's reconstruction gradient (z_pred is
+# detached before decode()), not the z branch itself.
+_ZRED_MAX_SPEC = 8.5
+
+# Generous safety clamp on RAW (pre-transform) latents -- mu_z, the
+# reparameterized z_raw sample, mu_15, and the reparameterized z_raw_15
+# sample are all clamped to this range (2026-08-12, dp2_v2). This is
+# deliberately wide: sigmoid/tanh are already saturated well before ±15
+# (sigmoid(15)~0.9999997), so it doesn't touch normal training dynamics --
+# it only stops the pathological unbounded excursions responsible for two
+# distinct instability mechanisms found in the dp2_v1 run (PLAN.md Failure
+# 13): (1) the _zred_sigma_phys Jacobian collapse when mu_z drifts toward an
+# unreachable z target, and (2) a KL-divergence blowup around epoch 1400
+# (mu_15**2 in the KL formula has no ceiling without this, unlike log_var_15
+# which was already clamped in round 1).
+_LATENT_CLAMP = 15.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bounded parameter transforms  (unconstrained → physical)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Ranges widened ~a bit past the original synthetic-SED-generation prior
+# (2026-08-12, dp2_v2) -- same accepted tradeoff already made for zred
+# (5.5->8.5): the frozen Speculator decoder extrapolates past its own
+# training range for galaxies whose true physical parameters sit outside
+# the original prior, but this only affects vae_head's reconstruction
+# gradient (z_pred/z_raw_15 feed the decoder detached), not the z branch.
+# Old range -> new range per parameter, for reference:
+#   logmass         [7, 12.5]     -> [6.5, 13.0]
+#   logzsol         [-1.98, 0.19] -> [-2.2, 0.3]
+#   dust2           [0, 4.0]      -> [0, 5.0]
+#   dust1_fraction  [0, 2.0]      -> [0, 2.5]
+#   dust_index      [-1.0, 0.4]   -> [-1.2, 0.5]
+#   gas_logz        [-2.0, 0.5]   -> [-2.2, 0.6]
+#   fagn            [1e-5, ~3]    -> [1e-5, ~10]
+#   agn_tau         [5, 150]      -> [~4, ~200]
+#   igm_scale       [0, 2.0]      -> [0, 2.5]
+#   logsfr_ratios_i [-5, 5]       -> [-6, 6]
 
 def constrain_params_15(z_raw_15: torch.Tensor) -> torch.Tensor:
     """
     Map unconstrained 15-dim latent → physical SPS params (zred excluded).
-    Identical transforms to PhotozVAE.constrain_params, indices 1-15.
+    Transforms widened from PhotozVAE.constrain_params -- see the range
+    table above.
 
     Parameters
     ----------
@@ -160,33 +205,38 @@ def constrain_params_15(z_raw_15: torch.Tensor) -> torch.Tensor:
     theta_15 : (batch, 15)  physical SPS parameters (no zred)
     """
     parts = [
-        torch.sigmoid(z_raw_15[:, 0:1])  * 5.5 + 7.0,                       # logmass
-        torch.tanh(z_raw_15[:, 1:2])     * 1.085 - 0.895,                   # logzsol
-        torch.sigmoid(z_raw_15[:, 2:3])  * 4.0,                            # dust2
-        torch.sigmoid(z_raw_15[:, 3:4])  * 2.0,                            # dust1_fraction
-        torch.tanh(z_raw_15[:, 4:5])     * 0.7 - 0.3,                       # dust_index
-        torch.tanh(z_raw_15[:, 5:6])     * 1.25 - 0.75,                     # gas_logz
-        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 6:7]) * 5.477 - 5.0),     # fagn
-        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 7:8]) * 1.477 + 0.699),   # agn_tau
-        torch.sigmoid(z_raw_15[:, 8:9])  * 2.0,                            # igm_scale
-        torch.tanh(z_raw_15[:, 9:])      * 5.0,                             # logsfr_ratios_0..5
+        torch.sigmoid(z_raw_15[:, 0:1])  * 6.5 + 6.5,                       # logmass
+        torch.tanh(z_raw_15[:, 1:2])     * 1.25 - 0.95,                     # logzsol
+        torch.sigmoid(z_raw_15[:, 2:3])  * 5.0,                            # dust2
+        torch.sigmoid(z_raw_15[:, 3:4])  * 2.5,                            # dust1_fraction
+        torch.tanh(z_raw_15[:, 4:5])     * 0.85 - 0.35,                     # dust_index
+        torch.tanh(z_raw_15[:, 5:6])     * 1.4 - 0.8,                       # gas_logz
+        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 6:7]) * 6.0 - 5.0),       # fagn
+        torch.pow(10.0, torch.sigmoid(z_raw_15[:, 7:8]) * 1.7 + 0.602),     # agn_tau
+        torch.sigmoid(z_raw_15[:, 8:9])  * 2.5,                            # igm_scale
+        torch.tanh(z_raw_15[:, 9:])      * 6.0,                             # logsfr_ratios_0..5
     ]
     return torch.cat(parts, dim=1)   # (batch, 15)
 
 
 # Numerical floor on the delta-method physical σ_z — prevents 1/σ² blowup
-# where the sigmoid Jacobian is tiny (z near 0 or 5.5).
-_ZRED_SIGMA_FLOOR = 1e-4
+# where the sigmoid Jacobian is tiny (z near 0 or _ZRED_MAX_SPEC). Raised from
+# 1e-4 -> 1e-3 (2026-08-11): 1e-4 still let 1/σ_z² reach ~1e8, enough to
+# reproduce the NLL blowup above even with the log_var_z clamp and the raised
+# _ZRED_MAX_SPEC headroom; 1e-3 caps it two orders of magnitude lower while
+# staying well under the ~2e-2(1+z) photo-z precision floor these models
+# target, so it shouldn't bite confident, well-constrained predictions.
+_ZRED_SIGMA_FLOOR = 1e-3
 
 
 def _zred_sigma_phys(mu_z: torch.Tensor, log_var_z: torch.Tensor) -> torch.Tensor:
     """
     Physical-space σ_z, propagated from the raw-space posterior
-    N(mu_z, var_z) through the sigmoid(·)×5.5 transform via a first-order
-    (delta-method) Jacobian evaluated at the mean:
+    N(mu_z, var_z) through the sigmoid(·)×_ZRED_MAX_SPEC transform via a
+    first-order (delta-method) Jacobian evaluated at the mean:
 
-        σ_z_phys ≈ σ_z_raw × d(sigmoid(z_raw)×5.5)/dz_raw |_{z_raw=mu_z}
-                 = σ_z_raw × 5.5 × s(1-s),   s = sigmoid(mu_z)
+        σ_z_phys ≈ σ_z_raw × d(sigmoid(z_raw)×_ZRED_MAX_SPEC)/dz_raw |_{z_raw=mu_z}
+                 = σ_z_raw × _ZRED_MAX_SPEC × s(1-s),   s = sigmoid(mu_z)
 
     Identical formula to PhotozVAE._zred_sigma_phys, applied to the
     standalone z latent instead of column 0 of the joint 16-dim one.
@@ -271,9 +321,9 @@ class MLPVAEEncoder(nn.Module):
         h = self.res_blocks(h)
 
         z_out     = self.z_head(h)
-        mu_z      = z_out[:, 0]
-        log_var_z = z_out[:, 1]#.clamp(-6.0, 4.0)
-        z_raw     = self.reparameterize(mu_z, log_var_z)
+        mu_z      = z_out[:, 0].clamp(-_LATENT_CLAMP, _LATENT_CLAMP)
+        log_var_z = z_out[:, 1].clamp(-6.0, 4.0)
+        z_raw     = self.reparameterize(mu_z, log_var_z).clamp(-_LATENT_CLAMP, _LATENT_CLAMP)
         z_pred    = torch.sigmoid(z_raw) * _ZRED_MAX_SPEC
 
         # SPS sampling depends on the z estimate: vae_head reads
@@ -281,8 +331,8 @@ class MLPVAEEncoder(nn.Module):
         # confined to vae_head's own weights.
         cond       = torch.cat([h.detach(), z_pred.detach().unsqueeze(1)], dim=1)
         vae_out    = self.vae_head(cond)
-        mu_15      = vae_out[:, :self.n_latent]
-        log_var_15 = vae_out[:, self.n_latent:]#.clamp(-6.0, 4.0)
+        mu_15      = vae_out[:, :self.n_latent].clamp(-_LATENT_CLAMP, _LATENT_CLAMP)
+        log_var_15 = vae_out[:, self.n_latent:].clamp(-6.0, 4.0)
 
         return z_pred, mu_z, log_var_z, mu_15, log_var_15
 
@@ -354,14 +404,14 @@ class PhotozMLPVAE(nn.Module):
         Returns z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15
         """
         z_pred, mu_z, log_var_z, mu_15, log_var_15 = self.encoder(x_phot)
-        z_raw_15 = self.encoder.reparameterize(mu_15, log_var_15)
+        z_raw_15 = self.encoder.reparameterize(mu_15, log_var_15).clamp(-_LATENT_CLAMP, _LATENT_CLAMP)
         return z_pred, mu_z, log_var_z, mu_15, log_var_15, z_raw_15
 
     # ── Decode ────────────────────────────────────────────────────────────
 
     def decode(self, z_pred: torch.Tensor, z_raw_15: torch.Tensor) -> torch.Tensor:
         """
-        z_pred   : (batch,)    physical redshift ∈ [0, 5.5] (sample or mean)
+        z_pred   : (batch,)    physical redshift ∈ [0, _ZRED_MAX_SPEC] (sample or mean)
         z_raw_15 : (batch, 15) unconstrained SPS latent
         Returns m_ab : (batch, 10) reconstructed AB magnitudes
         """
@@ -403,7 +453,7 @@ class PhotozMLPVAE(nn.Module):
 
         Returns
         -------
-        z_pred      : (batch,)    physical redshift  ∈ [0, 5.5]
+        z_pred      : (batch,)    physical redshift  ∈ [0, _ZRED_MAX_SPEC]
         log_sigma_z : (batch,)    log σ_z, derived from log_var_z
         theta_full  : (batch, 16) physical SPS parameters
         """
@@ -420,7 +470,7 @@ class PhotozMLPVAE(nn.Module):
         Draw posterior samples for each galaxy.
 
         z is sampled from its own raw-space Gaussian and pushed through
-        sigmoid(·)×5.5; the 15 SPS params are sampled independently from
+        sigmoid(·)×_ZRED_MAX_SPEC; the 15 SPS params are sampled independently from
         the VAE posterior (mu_15, log_var_15), which was itself conditioned
         on a single z point during the forward pass — same approximation
         used by the reference model's posterior sampling (mu_15 is not
@@ -604,13 +654,42 @@ class PhotozMLPVAE(nn.Module):
     @classmethod
     def load(cls, path: str, speculator_dir: str, filter_dir: str,
              device: str = "cpu"):
-        """Load model from saved checkpoint."""
+        """
+        Load model from saved checkpoint.
+
+        The checkpoint's frozen-decoder buffers WIN over whatever
+        speculator/filter files are currently on disk: __init__ builds the
+        decoder from `speculator_dir`, but if those files have since been
+        retrained with different shapes (e.g. the 2026-08-12 Inoue zmax-6.5
+        retrain changed the PCA dimensionalities), the freshly-built buffers
+        are re-registered to the checkpoint's shapes before load_state_dict,
+        so the model decodes with the exact decoder it was trained against.
+        """
         payload = torch.load(path, map_location=device, weights_only=False)
         cfg     = payload["encoder_config"]
         model   = cls(speculator_dir, filter_dir,
                       encoder_width=cfg["width"],
                       encoder_n_in=cfg.get("n_in", 40))
-        model.load_state_dict(payload["model_state"])
+
+        state = payload["model_state"]
+        n_fixed = 0
+        for name, saved in state.items():
+            mod_path, _, attr = name.rpartition(".")
+            try:
+                mod = model.get_submodule(mod_path)
+            except AttributeError:
+                continue
+            if attr in mod._buffers and mod._buffers[attr] is not None \
+                    and mod._buffers[attr].shape != saved.shape:
+                mod._buffers[attr] = saved.clone().to(mod._buffers[attr].device)
+                n_fixed += 1
+        if n_fixed:
+            print(f"NOTE: {n_fixed} frozen-decoder buffers on disk "
+                  f"({speculator_dir}) have different shapes than this "
+                  f"checkpoint was trained with -- using the checkpoint's "
+                  f"own decoder buffers.")
+
+        model.load_state_dict(state)
         model.to(device)
         model.eval()
         return model, payload.get("scaler"), payload.get("col_medians")

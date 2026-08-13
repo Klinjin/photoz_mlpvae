@@ -105,7 +105,7 @@ x_phot (B, D)   D = 26 (LSST-only+det), 24 (LSST-only), 42 (LSST+Euclid+det), 40
 └───┬───────────────┘   └─────────────┬────────────────────────┘
     │ reparameterize                  │
     │ z_raw ~ N(mu_z, var_z)          constrain_params_15(z_raw_15)
-    │ z_pred = sigmoid(z_raw)×5.5     │         (B, 15)
+    │ z_pred = sigmoid(z_raw)×_ZRED_MAX_SPEC (8.5) │  (B, 15)
     └──────────────┬───────────────────┘
                    │
           theta_full = cat([z_pred, theta_15], dim=1)   (B, 16)
@@ -181,6 +181,26 @@ CDFS spectroscopic redshifts (SITCOMTN-154):
 
 Total labeled galaxies: ~9,006. Small dataset — warm-starting from synthetic
 pre-training is important (see `--init-from`).
+
+### DP2 SOM-matched (real observations — `train_dp2.py`)
+
+Loads parquet catalogs directly (not pre-split HDF5) and applies the
+galaxy/valid-z cuts itself:
+
+| Split | File | N (raw → after `refExtendedness==1`) |
+|-------|------|---|
+| Train | `415_clipped_train_rtn124_parquet_.../train_clipped_v3.parquet` | 554,676 → 503,689 |
+| Val   | carved from train at runtime (`--val-frac`, default 10%)         | — |
+| Test  | `412_som_test_rtn124_parquet_.../test_som_mc_matched_v3.parquet` | 18,400 → 17,278 |
+
+No Euclid columns in either file (`use_euclid` hardcoded False). `--z-max`
+(default 5.5) drops train/val galaxies above that spec-z — test always
+evaluates on the full, uncut range. `--use-gaap`-equivalent GAAP mags are
+the default here (`--cmodel` to switch to cModel). Also saves
+`phase1_end.pt` — the pure z-supervised checkpoint at the instant Phase 2
+would otherwise unfreeze `vae_head`, independent of `best.pt`'s
+rolling-average tracking. See PLAN.md for the z_max A/B test and the
+NaN-crash investigation (Failure 13).
 
 ### Synthetic SEDs (`train_synth.py`)
 
@@ -418,7 +438,12 @@ photoz_mlpvae/
 ├── scripts/
 │   ├── __init__.py
 │   ├── train_synth.py            # Synthetic SED pre-training
-│   └── train_dp1.py              # Real dp1_v4 ECDFS fine-tuning (HDF5 presplit)
+│   ├── train_dp1.py              # Real dp1_v4 ECDFS fine-tuning (HDF5 presplit)
+│   ├── train_dp2.py              # Real DP2 SOM-matched fine-tuning (parquet, loads+cuts itself)
+│   ├── extract_activations.py    # Per-layer activations + targets → .npz (representation study)
+│   └── fit_linear_probes.py      # Ridge probes per (layer, target): R² vs depth
+├── representation/               # Representation study: docs, probe npz's, results
+│   └── README.md                 #   (does the SED latent add info for z / σ_z?)
 └── trained/
     └── <model-name>/
         ├── best.pt

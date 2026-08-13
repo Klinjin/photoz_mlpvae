@@ -1,38 +1,74 @@
 """
-train_hdf5.py
-=============
-Training script for PhotozMLPVAE using pre-split HDF5 catalogs.
+train_dp2.py
+============
+Training script for PhotozMLPVAE on DP2 (Rubin Data Preview 2) spec-z
+catalogs, loaded directly from parquet rather than the pre-split HDF5 files
+train_dp1.py consumes.
 
-Differences from train.py
---------------------------
-  - Data loaded from HDF5 train/test files (pre-split by upstream pipeline)
-  - Val split carved out of the HDF5 train file (VAL_FRAC, default 10%)
-  - use_euclid defaults to False (LSST-only, 24-dim encoder input)
-  - All other architecture / training logic identical to train.py
+Data
+----
+  Train : 415_clipped_train_rtn124_parquet_.../train_clipped_v3.parquet
+          (554,676 rows total; galaxies + stars + AGN/QSO mixed together)
+  Test  : 412_som_test_rtn124_parquet_.../test_som_mc_matched_v3.parquet
+          (18,400 rows; SOM-matched Monte Carlo test set)
+
+Both catalogs use the same LSST-band column convention as the DP1 catalogs
+(u/g/r/i/z/y_{cModel,gaap1p0,psf,kron}Mag[Err], refExtendedness, redshift)
+and are handled by the same obs_catalog/dataloader.py helpers -- but they
+carry no Euclid columns at all, so use_euclid is hardcoded False here
+(build_features would KeyError on the Euclid columns otherwise).
+
+Differences from train_dp1.py
+------------------------------
+  - Loads raw parquet (not pre-split HDF5); applies the refExtendedness==1
+    (galaxy) + valid-z + z_max cuts itself (load_parquet_galaxies), then
+    carves a val split out of the train parquet (VAL_FRAC, default 10%),
+    matching train_dp1.py's HDF5 val-carve behaviour.
+  - use_euclid is not exposed as a CLI flag -- LSST-only encoder input
+    (24-dim in colour mode, since no Euclid columns exist to include).
+  - use_gaap defaults to True (DP2 request specifically asked for GAAP
+    1.0" aperture mags); pass --cmodel to use cModel mags instead.
+  - z_max (default 5.5) drops galaxies whose spec-z exceeds the range
+    compute_z_weights bins over / the 'old' model's z_head can represent
+    (the 'new' z-separated head's cap is model/photoz_mlpvae.py's
+    _ZRED_MAX_SPEC, raised 6.5->8.5 on 2026-08-11 to cover DP2's high-z
+    tail) -- <0.1% of rows in both files, so this is a cheap way to avoid
+    unrepresentable labels quietly
+    biasing the loss rather than a real coverage loss. This cut is
+    train/val-only: the test parquet is always loaded with z_max=None
+    (full, uncut redshift range), so σ_NMAD/outlier numbers reflect
+    real-world performance -- including any tail the model was never
+    trained on -- and stay comparable across different --z-max choices.
+  - model_version defaults to "new" (the z-separated architecture; see
+    photoz_mlpvae/README.md -- it holds the current best σ_NMAD/outlier
+    numbers on DP1) rather than train_dp1.py's "old" default.
+  - init_from defaults to the LSST-only/GAAP synthetic-SED warm-start
+    checkpoint (mlpvae_synth_zsep_v1_no_euclid_gaap1p0/best.pt), the same
+    one the current best DP1 recipe warm-starts from. Pass --init-from ""
+    (or "none") to train from scratch instead.
+  - Shared plotting/epoch-loop helpers (_Tee, sigma_nmad, split_train_val,
+    plot_curves, plot_lr_and_gradnorm, plot_z_weights, run_epoch) are
+    imported from train_dp1.py rather than duplicated.
+  - All other architecture / training logic identical to train_dp1.py.
 
 Usage
 -----
-    ~/miniforge3/envs/WL_ML_Challenge/bin/python photoz_mlpvae/scripts/train_hdf5.py
-    ~/miniforge3/envs/WL_ML_Challenge/bin/python photoz_mlpvae/scripts/train_hdf5.py \\
-        --model-name mlpvae_v2_lsst_colors
-    ~/miniforge3/envs/WL_ML_Challenge/bin/python photoz_mlpvae/scripts/train_hdf5.py \\
-        --no-colors
+    ~/miniforge3/envs/WL_ML_Challenge/bin/python photoz_mlpvae/scripts/train_dp2.py
+    ~/miniforge3/envs/WL_ML_Challenge/bin/python photoz_mlpvae/scripts/train_dp2.py \\
+        --model-name mlpvae_dp2_v1_lsst_gaap1p0 --epochs 2000 --lr 1e-3 --lam-z-min 20
 """
 
-import os, sys, time, argparse, warnings, yaml, datetime
+import os, sys, argparse, warnings, yaml, datetime
 import numpy as np
 import pandas as pd
-import h5py
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 _BASE = "/astro/users/lindajin"
 sys.path.insert(0, _BASE)
 from obs_catalog.dataloader import (
     build_features, compute_z_weights, make_dataloader,
-    REF_MAG, GAAP_REF_MAG,
+    REF_MAG, GAAP_REF_MAG, TARGET_COL,
 )
 from photoz_utils import (
     plot_scatter, plot_redshift_hist, plot_metrics_vs_zpred,
@@ -41,348 +77,119 @@ from photoz_utils import (
     compute_metrics,
     plot_scatter_density, plot_metrics_binned_3sig,
 )
+from photoz_mlpvae.scripts.train_dp1 import (
+    _Tee, sigma_nmad, split_train_val,
+    plot_curves, plot_lr_and_gradnorm, plot_z_weights, run_epoch,
+    report_quality_cut_metrics,
+)
 warnings.filterwarnings("ignore")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _Tee:
-    def __init__(self, stream, fpath):
-        self._stream = stream
-        self._file   = open(fpath, "a", buffering=1)
-
-    def write(self, data):
-        self._stream.write(data)
-        self._file.write(data)
-
-    def flush(self):
-        self._stream.flush()
-        self._file.flush()
-
-    def close(self):
-        self._file.close()
-
-    def __getattr__(self, attr):
-        return getattr(self._stream, attr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Adjustables
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL_NAME     = "mlpvae_v1_lsst"
-TRAIN_HDF5     = os.path.join(
+MODEL_NAME    = "mlpvae_dp2_v3_lsst_gaap1p0"
+TRAIN_PARQUET = os.path.join(
     _BASE, "obs_catalog", "data",
-    "83_training_v4_match_ecdfs_sitcomtn154_27184412354f233d1b9f512bdf350d58",
-    "dp1_matched_v4_train.hdf5",
+    "415_clipped_train_rtn124_parquet_0103491bd9870eb3d19bd89fa6cd57a9",
+    "train_clipped_v3.parquet",
 )
-TEST_HDF5      = os.path.join(
+TEST_PARQUET = os.path.join(
     _BASE, "obs_catalog", "data",
-    "84_test_v4_match_ecdfs_sitcomtn154_1ec71937ff3e4a0a8283535193764ec7",
-    "dp1_matched_v4_test.hdf5",
+    "412_som_test_rtn124_parquet_80763a5a141d268b7c6ed332ab552fbd",
+    "test_som_mc_matched_v3.parquet",
 )
-SPECULATOR_DIR = os.path.join(_BASE, "speculator", "trained", "Inoue_IGM")
-FILTER_DIR     = os.path.join(_BASE, "obs_catalog", "filters")
-OUT_BASE       = os.path.join(_BASE, "photoz_mlpvae", "trained")
+SPECULATOR_DIR  = os.path.join(_BASE, "speculator", "trained", "Inoue_IGM")
+FILTER_DIR      = os.path.join(_BASE, "obs_catalog", "filters")
+OUT_BASE        = os.path.join(_BASE, "photoz_mlpvae", "trained")
+SYNTH_INIT_CKPT = os.path.join(
+    # v2 (2026-08-12): warm-start source retrained against the new Inoue
+    # speculator (SEDs regenerated with ZMAX 5.5->6.5; see
+    # speculator/retrain_inoue_zmax6p5.log). v1 was pretrained against the
+    # stale z<=5.5 decoder -- using it here would warm-start the encoder to
+    # decode through a speculator it was never matched to.
+    _BASE, "photoz_mlpvae", "trained",
+    "mlpvae_synth_zsep_v2_no_euclid_gaap1p0", "best.pt",
+)
 
-USE_COLORS     = True    # default: colour-based features
-USE_EUCLID     = False   # LSST-only (24-dim encoder input)
-VAL_FRAC       = 0.10    # fraction of HDF5 train file reserved for validation
+USE_COLORS = True     # default: colour-based features
+VAL_FRAC   = 0.10      # fraction of train parquet reserved for validation
+Z_MAX      = 5.5       # drop z_spec above this (see module docstring)
 
-MAX_EPOCHS    = 500
-BATCH_SIZE    = 256
-LR            = 1e-4
-PATIENCE      = MAX_EPOCHS//5
-WARMUP_FRAC   = 0.10   # Phase 1 length as a fraction of total epochs
-RECON_RAMP    = 50
-BETA_EPOCHS   = 50
-SEED          = 42
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+# MAX_EPOCHS reduced 2000->600 (dp2_v1 -> dp2_v2, 2026-08-12): DP2's train
+# set has ~1,770 batches/epoch vs. DP1's ~24 (this recipe's epoch/warmup
+# counts were originally tuned on DP1's much smaller set), so dp2_v1's
+# 200-epoch warmup alone was ~354k gradient steps -- more than DP1's entire
+# 2000-epoch schedule (~48k steps). Empirically, dp2_v1's rolling-avg
+# σ_NMAD reached 0.0637 by epoch 500 vs. its final 0.0555 at epoch 1905 (a
+# ~13% gap) while consuming half the run's ~13.3h wall-clock for that last
+# stretch -- diminishing returns past roughly this point. 600 keeps some
+# margin past the epoch-500 mark actually observed to still be improving.
+MAX_EPOCHS  = 600
+BATCH_SIZE  = 256
+LR          = 1e-3
+PATIENCE    = MAX_EPOCHS // 5
+WARMUP_FRAC = 0.10     # Phase 1 length as a fraction of total epochs
+RECON_RAMP  = 50
+BETA_EPOCHS = 50
+SEED        = 42
+DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
-LAM_Z        = 20.0
-LAM_R        = 0.1
-LAM_Z_MIN    = 2.0         #  λ_z reduction at Phase 2 (v1 scheme)
+LAM_Z         = 20.0
+LAM_R         = 0.1
+LAM_Z_MIN     = 20.0   # no Phase-2 dip -- flat λ_z beat the dip-and-restore
+                        # scheme on the DP1 zsep_v4 sweep (see PLAN.md)
 LAM_Z_RESTORE = 50
-BETA_MAX     = 0.1
-SIGMA_FLOOR  = 0.3
+BETA_MAX      = 0.1
+SIGMA_FLOOR   = 0.3
 N_ZBINS_WEIGHT = 25
-Z_WEIGHT_CAP  = 10.0        # cap z-weights at this multiple of mean (prevent 277× extremes)
+Z_WEIGHT_CAP   = 10.0
 
-PHASE2_VAE_LR_FRAC   = 1.0  # vae_head at full LR (v1 scheme)
-GRAD_NORM_REF        = 2.0  # former clip threshold; kept only as a reference line for plots
-NMAD_AVG_WINDOW      = 5    # rolling-average window for checkpoint criterion (smooths 677-gal noise)
-TRAIN_PLAN          = "always sigma_NMAD for best model"  # "phase1_warmup_then_phase2" or "joint_training"
-# ─────────────────────────────────────────────────────────────────────────────
-# HDF5 loader
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_hdf5(path: str) -> pd.DataFrame:
-    """Read an HDF5 catalog into a pandas DataFrame."""
-    with h5py.File(path, "r") as f:
-        return pd.DataFrame({k: f[k][:] for k in f.keys()})
-
-
-def split_train_val(df: pd.DataFrame, val_frac: float, seed: int):
-    """Random train/val split of a DataFrame."""
-    rng    = np.random.RandomState(seed)
-    idx    = rng.permutation(len(df))
-    n_val  = int(val_frac * len(df))
-    tr_df  = df.iloc[idx[n_val:]].reset_index(drop=True)
-    val_df = df.iloc[idx[:n_val]].reset_index(drop=True)
-    return tr_df, val_df
+PHASE2_VAE_LR_FRAC = 1.0
+GRAD_NORM_REF       = 2.0
+TRAIN_PLAN          = "always sigma_NMAD for best model"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics
+# Parquet loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sigma_nmad(z_pred, z_true):
-    dz  = (z_pred - z_true) / (1.0 + z_true)
-    med = np.nanmedian(dz)
-    return 1.4826 * np.nanmedian(np.abs(dz - med))
-
-
-# σ_z-based quality-cut retention level(s) to report alongside the headline
-# full-sample test metrics. NOT a validated/reused recipe -- this exact
-# reusable function did not exist before 2026-08-12; it's new code. PLAN.md's
-# Open Problems mentions a one-off, never-productionized measurement from an
-# unresolved bias-campaign investigation ("baseline σ_z cut at 70% retention
-# -> σ_NMAD 0.0202"), on some earlier sweep-trial checkpoint, not
-# necessarily this architecture version or reproduced by this code path.
-# Treat that number as "one exploratory data point suggesting this kind of
-# cut can help," not as evidence this implementation will reproduce it.
-# Post-hoc reporting only -- never affects training. Shared by train_dp1.py
-# and train_dp2.py (imported from here).
-QUALITY_CUT_RETENTION = (0.70,)
-
-
-def report_quality_cut_metrics(dz_te, z_te, z_std_te, retention_fracs=QUALITY_CUT_RETENTION):
+def load_parquet_galaxies(path: str, z_max: float = None, label: str = "catalog") -> pd.DataFrame:
     """
-    Rank the test set by the model's own predicted σ_z (ascending -- most
-    confident first), keep the top `retain_frac`, and print the same five
-    headline metrics (see compute_metrics) on that subset.
+    Read a DP2 parquet catalog and keep extended sources (refExtendedness==1)
+    with a valid, representable spec-z (0 < z, and z <= z_max if given).
+    Mirrors load_catalog()'s galaxy selection in obs_catalog/dataloader.py,
+    but coerces refExtendedness/redshift through pd.to_numeric first: these
+    DP2 exports store them as pandas-nullable columns, and comparing those
+    directly can leave stray <NA> entries in the boolean mask (pandas raises
+    on "df[mask]" if any survive), whereas a coerced float64 numpy array
+    turns NA into a plain NaN that compares to False as expected.
     """
-    print(f"\n=== Quality-cut test metrics (most-confident-by-σ_z subset) ===")
-    for retain_frac in retention_fracs:
-        n_keep   = int(retain_frac * len(z_std_te))
-        keep_idx = np.argsort(z_std_te)[:n_keep]
-        b, n, fo, r, fc = compute_metrics(dz_te[keep_idx], z_te[keep_idx])
-        print(f"  retain={retain_frac*100:.0f}%  n={n_keep:,}  σ_NMAD={n:.4f}  "
-              f"bias={b:.4f}  outliers={fo*100:.2f}%  RMS={r:.4f}  f_cat={fc*100:.2f}%")
+    df = pd.read_parquet(path)
+    n0 = len(df)
 
+    ext = pd.to_numeric(df["refExtendedness"], errors="coerce").to_numpy(dtype="float64")
+    z   = pd.to_numeric(df[TARGET_COL],        errors="coerce").to_numpy(dtype="float64")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss curves plot
-# ─────────────────────────────────────────────────────────────────────────────
+    ext_ok  = (ext == 1)
+    z_ok    = np.isfinite(z) & (z > 0)
+    zmax_ok = (z <= z_max) if z_max is not None else np.ones(n0, dtype=bool)
+    keep    = ext_ok & z_ok & zmax_ok
 
-def plot_curves(history: dict, path: str, events: list = None):
-    """
-    Two-row layout: one wide total-loss panel on top, four breakdown panels below.
-    events: list of (epoch_index, label) for phase/lambda change annotations.
-    """
-    import matplotlib.gridspec as gridspec
+    gals = df.loc[keep].copy()
+    gals[TARGET_COL] = gals[TARGET_COL].astype(float)
 
-    fig = plt.figure(figsize=(20, 7))
-    gs  = gridspec.GridSpec(2, 4, figure=fig, height_ratios=[1.4, 1],
-                            hspace=0.35, wspace=0.3)
-    ax_top  = fig.add_subplot(gs[0, :])
-    ax_subs = [fig.add_subplot(gs[1, i]) for i in range(4)]
-
-    keys   = ["total", "z_sup", "recon", "kl", "log_sigma_z"]
-    labels = ["Total loss", "z NLL", "Reconstruction", "KL", "mean log σ_z"]
-
-    prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    event_colors = [prop_cycle[(i + 2) % len(prop_cycle)]
-                    for i in range(len(events) if events else 0)]
-
-    def _draw_events(ax, label_in_legend):
-        if not events:
-            return
-        for (x, lbl), color in zip(events, event_colors):
-            ax.axvline(x, ls=":", color=color, lw=1.4,
-                       label=f"ep {x}: {lbl}" if label_in_legend else None)
-
-    def _has_data(key):
-        vals = history.get(key)
-        return bool(vals) and np.any(np.isfinite(np.asarray(vals, dtype=float)))
-
-    # ── Top: total loss ──────────────────────────────────────────────────────
-    k, lab = "total", labels[0]
-    if _has_data(f"tr_{k}"):
-        ax_top.plot(history[f"tr_{k}"],  label="train")
-    if _has_data(f"val_{k}"):
-        ax_top.plot(history[f"val_{k}"], label="val", ls="--")
-    _draw_events(ax_top, label_in_legend=True)
-    ax_top.set_title(lab, fontsize=12)
-    ax_top.set_xlabel("epoch")
-    ax_top.legend(fontsize=9, loc="upper right")
-
-    # ── Bottom: breakdown losses ─────────────────────────────────────────────
-    for ax, k, lab in zip(ax_subs, keys[1:], labels[1:]):
-        if _has_data(f"tr_{k}"):
-            ax.plot(history[f"tr_{k}"],  label="train")
-        if _has_data(f"val_{k}"):
-            ax.plot(history[f"val_{k}"], label="val", ls="--")
-        _draw_events(ax, label_in_legend=False)
-        ax.set_title(lab, fontsize=10)
-        ax.set_xlabel("epoch")
-        ax.legend(fontsize=7)
-
-    fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Curves → {path}")
-
-
-def plot_lr_and_gradnorm(history: dict, path: str, grad_norm_ref: float = GRAD_NORM_REF,
-                          clip_applied: bool = True, events: list = None):
-    """
-    Two stacked panels sharing the epoch axis: LR (log scale, per param group)
-    on top, training gradient norm (mean+max) on the bottom with a dotted
-    reference line at the clip threshold actually used for this run (or, if
-    clipping was disabled, at the value it would have used for comparison).
-    """
-    BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
-    MUTED = "#898781"
-
-    fig, (ax_lr, ax_gn) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
-                                        gridspec_kw={"height_ratios": [1, 1.1], "hspace": 0.12})
-
-    epochs = list(range(1, len(history["lr_trunk"]) + 1))
-    ax_lr.plot(epochs, history["lr_trunk"], color=BLUE, lw=2, label="trunk / z_head / σ_z_head")
-    vae_epochs = [e for e, v in zip(epochs, history["lr_vae"]) if v is not None]
-    vae_vals   = [v for v in history["lr_vae"] if v is not None]
-    if vae_vals:
-        ax_lr.plot(vae_epochs, vae_vals, color=ORANGE, lw=2, label="vae_head")
-    ax_lr.set_yscale("log")
-    ax_lr.set_ylabel("Learning rate")
-    ax_lr.legend(fontsize=8, frameon=False, loc="upper right")
-
-    ax_gn.plot(epochs, history["grad_norm_mean"], color=AQUA, lw=2, label="mean (per-batch)")
-    ax_gn.plot(epochs, history["grad_norm_max"], color=AQUA, lw=1, alpha=0.5, ls="--",
-               label="max (per-batch)")
-    ref_label = (f"clip threshold ({grad_norm_ref:g})" if clip_applied else
-                 f"clip threshold ({grad_norm_ref:g}, not applied here)")
-    ax_gn.axhline(grad_norm_ref, color=MUTED, lw=1, ls=":", label=ref_label)
-    ax_gn.set_yscale("log")  # norms span many orders of magnitude (esp. epoch 1)
-    ax_gn.set_ylabel("Grad norm" + ("" if clip_applied else " (unclipped)"))
-    ax_gn.set_xlabel("epoch")
-    ax_gn.legend(fontsize=8, frameon=False, loc="upper right")
-
-    if events:
-        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-        for ax in (ax_lr, ax_gn):
-            for i, (x, _) in enumerate(events):
-                ax.axvline(x, ls=":", color=prop_cycle[(i + 2) % len(prop_cycle)], lw=1.2)
-
-    fig.suptitle("Learning rate & gradient norm", fontsize=11, x=0.01, ha="left")
-    fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  LR/grad-norm → {path}")
-
-
-def plot_z_weights(z_tr, zw_raw, zw_capped, cap, path,
-                   n_bins=N_ZBINS_WEIGHT, z_max=5.5):
-    """
-    Two stacked panels sharing the z axis: training-set redshift histogram
-    (the same binning compute_z_weights uses) on top, per-galaxy loss weight
-    vs z_spec on the bottom — raw inverse-frequency weights and the
-    capped+renormalized weights actually used, with the cap level marked.
-    """
-    BLUE, ORANGE = "#2a78d6", "#eb6834"
-    MUTED = "#898781"
-
-    fig, (ax_h, ax_w) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True,
-                                      gridspec_kw={"height_ratios": [1, 1.2], "hspace": 0.12})
-
-    edges = np.linspace(0.0, z_max, n_bins + 1)
-    ax_h.hist(z_tr, bins=edges, color=BLUE, alpha=0.85)
-    ax_h.set_ylabel("N train galaxies")
-    ax_h.set_yscale("log")
-    ax_h.set_title(f"z-weights (n_bins={n_bins}, cap={cap:g}× mean)",
-                   fontsize=11, loc="left")
-
-    order = np.argsort(z_tr)
-    ax_w.plot(z_tr[order], zw_raw[order], color=MUTED, lw=1, alpha=0.6,
-              label="raw inverse-frequency")
-    ax_w.plot(z_tr[order], zw_capped[order], color=ORANGE, lw=2,
-              label="capped + renormalized (used)")
-    if cap and cap > 0:
-        ax_w.axhline(cap, color=MUTED, lw=1, ls=":", label=f"cap ({cap:g})")
-    ax_w.set_yscale("log")
-    ax_w.set_xlabel("z_spec")
-    ax_w.set_ylabel("loss weight")
-    ax_w.legend(fontsize=8, frameon=False, loc="upper left")
-
-    fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  z-weights → {path}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_epoch(model, loader, device, opt=None,
-              lam_z=LAM_Z, lam_r=LAM_R, beta=0.0,
-              sigma_floor=SIGMA_FLOOR, use_nll_z=True,
-              grad_clip_max_norm=GRAD_NORM_REF):
-    is_train = (opt is not None)
-    model.train() if is_train else model.eval()
-
-    totals = {k: 0.0 for k in ("total", "z_sup", "recon", "kl", "log_sigma_z")}
-    n = 0
-    grad_norms = []  # pre-clip total norm, one entry per training batch
-
-    ctx = torch.enable_grad if is_train else torch.no_grad
-
-    with ctx():
-        for x_b, mags_b, errs_b, mask_b, z_b, zw_b in loader:
-            x_b    = x_b.to(device)
-            mags_b = mags_b.to(device)
-            errs_b = errs_b.to(device)
-            mask_b = mask_b.to(device)
-            z_b    = z_b.to(device)
-            zw_b   = zw_b.to(device)
-
-            if is_train:
-                opt.zero_grad()
-
-            losses = model.loss(
-                x_b, mags_b, errs_b, mask_b, z_b,
-                lam_z=lam_z, lam_r=lam_r, beta=beta,
-                sigma_floor=sigma_floor,
-                z_weights=zw_b,
-                use_nll_z=use_nll_z,
-            )
-
-            if is_train:
-                losses["total"].backward()
-                if grad_clip_max_norm and grad_clip_max_norm > 0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(
-                        model.encoder.parameters(), grad_clip_max_norm)
-                else:
-                    grads = [p.grad.detach() for p in model.encoder.parameters()
-                             if p.grad is not None]
-                    total_norm = torch.norm(torch.stack([g.norm(2) for g in grads]), 2)
-                grad_norms.append(total_norm.item())
-                opt.step()
-
-            bs = len(x_b)
-            for k in totals:
-                totals[k] += losses[k].item() * bs
-            n += bs
-
-    grad_norm_stats = None
-    if is_train and grad_norms:
-        gn = np.array(grad_norms)
-        grad_norm_stats = dict(
-            mean=float(gn.mean()),
-            max=float(gn.max()),
-        )
-
-    return {k: v / n for k, v in totals.items()}, grad_norm_stats
+    n_star = int((~ext_ok).sum())
+    n_badz = int((ext_ok & ~z_ok).sum())
+    n_hiz  = int((ext_ok & z_ok & ~zmax_ok).sum())
+    msg = (f"  {label}: {n0:,} rows  ->  refExtendedness==1: {int(ext_ok.sum()):,} "
+           f"(dropped {n_star:,} non-galaxy/unknown)  ->  valid z>0: "
+           f"{int((ext_ok & z_ok).sum()):,} (dropped {n_badz:,})")
+    if z_max is not None:
+        msg += f"  ->  z<={z_max:g}: {len(gals):,} (dropped {n_hiz:,})"
+    print(msg)
+    return gals.reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,9 +199,13 @@ def run_epoch(model, loader, device, opt=None,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name",    default=MODEL_NAME)
-    parser.add_argument("--train-hdf5",    default=TRAIN_HDF5)
-    parser.add_argument("--test-hdf5",     default=TEST_HDF5)
+    parser.add_argument("--train-parquet", default=TRAIN_PARQUET)
+    parser.add_argument("--test-parquet",  default=TEST_PARQUET)
     parser.add_argument("--val-frac",      type=float, default=VAL_FRAC)
+    parser.add_argument("--z-max",         type=float, default=Z_MAX,
+                        help=f"Drop train/val galaxies with z_spec above this (default "
+                             f"{Z_MAX:g}); <=0 disables the cut. Test is never cut -- it "
+                             f"always evaluates on the full redshift range.")
     parser.add_argument("--epochs",        type=int,   default=MAX_EPOCHS)
     parser.add_argument("--patience",      type=int,   default=None,
                         help="Early-stop patience in epochs (default: epochs//5)")
@@ -416,21 +227,19 @@ def main():
                              "(<=0 disables clipping; norm is still measured either way)")
     parser.add_argument("--z-weight-cap",       type=float, default=Z_WEIGHT_CAP,
                         help="Cap z-weights at this multiple of mean (0 = no cap)")
-    parser.add_argument("--init-from",          default=None,
-                        help="Path to a checkpoint to partial-init from (shape-matched layers)")
+    parser.add_argument("--init-from",          default=SYNTH_INIT_CKPT,
+                        help="Path to a checkpoint to partial-init from (shape-matched "
+                             "layers); '' or 'none' disables warm-start")
     parser.add_argument("--device",        default=DEVICE)
     parser.add_argument("--no-colors",  action="store_true",
                         help="Use raw magnitude features instead of colours")
-    parser.add_argument("--euclid",     action="store_true",
-                        help="Include Euclid bands (default: LSST-only)")
-    parser.add_argument("--use-gaap",   action="store_true",
-                        help="Use GAAP 1.0-arcsec aperture mags for LSST bands instead of cModel")
-    parser.add_argument("--model-version", choices=["old", "new", "mdn"], default="old",
+    parser.add_argument("--cmodel",     action="store_true",
+                        help="Use cModel mags instead of GAAP 1.0-arcsec aperture mags "
+                             "(default: GAAP, per DP2 request)")
+    parser.add_argument("--model-version", choices=["old", "new", "mdn"], default="new",
                         help="'old' = 3-head photoz_mlpvae_old (16-dim joint VAE); "
-                             "'new' = photoz_mlpvae z-separated design (dedicated "
-                             "z MLP head, 15-param VAE head conditioned on z); "
-                             "'mdn' = z-separated with mixture-density z head "
-                             "(K=3, dominant-mode point estimate)")
+                             "'new' (default) = photoz_mlpvae z-separated design, current "
+                             "best on DP1; 'mdn' = z-separated with mixture-density z head")
     parser.add_argument("--out-base",   default=OUT_BASE,
                         help="Base directory for the run's output folder")
     parser.add_argument("--trial",      action="store_true",
@@ -442,8 +251,11 @@ def main():
         args.warmup_epochs = max(1, round(WARMUP_FRAC * args.epochs))
 
     use_colors = not args.no_colors
-    use_euclid = args.euclid
-    use_gaap   = args.use_gaap
+    use_euclid = False   # DP2 parquet catalogs carry no Euclid columns
+    use_gaap   = not args.cmodel
+    z_max      = args.z_max if (args.z_max is not None and args.z_max > 0) else None
+    init_from  = (args.init_from if args.init_from and
+                  args.init_from.strip().lower() not in ("", "none") else None)
 
     out_dir = os.path.join(args.out_base, args.model_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -459,10 +271,11 @@ def main():
     # ── Config ────────────────────────────────────────────────────────────
     config = dict(
         model_name     = args.model_name,
-        data_source    = "hdf5_presplit",
-        train_hdf5     = args.train_hdf5,
-        test_hdf5      = args.test_hdf5,
+        data_source    = "dp2_parquet",
+        train_parquet  = args.train_parquet,
+        test_parquet   = args.test_parquet,
         val_frac       = args.val_frac,
+        z_max_train    = z_max,   # train/val cut only -- test is always the full range
         use_colors     = use_colors,
         use_euclid     = use_euclid,
         use_gaap       = use_gaap,
@@ -478,7 +291,7 @@ def main():
         phase2_vae_lr_frac  = args.phase2_vae_lr_frac,
         grad_clip_max_norm  = args.grad_clip_max_norm,
         z_weight_cap        = args.z_weight_cap,
-        init_from           = args.init_from,
+        init_from           = init_from,
         beta_max            = BETA_MAX,
         beta_epochs         = BETA_EPOCHS,
         recon_ramp          = RECON_RAMP,
@@ -490,7 +303,6 @@ def main():
         filter_dir          = FILTER_DIR,
         training_scheme     = TRAIN_PLAN,
         model_version       = args.model_version,
-
     )
     cfg_path = os.path.join(out_dir, "config.yaml")
     with open(cfg_path, "w") as f:
@@ -498,12 +310,17 @@ def main():
     print(f"Config → {cfg_path}")
 
     # ── Data ─────────────────────────────────────────────────────────────
-    print(f"\nLoading train HDF5: {args.train_hdf5}")
-    tr_val_df = load_hdf5(args.train_hdf5)
+    print(f"\nLoading train parquet: {args.train_parquet}")
+    tr_val_df = load_parquet_galaxies(args.train_parquet, z_max=z_max, label="train parquet")
     tr_df, val_df = split_train_val(tr_val_df, args.val_frac, SEED)
 
-    print(f"Loading test HDF5:  {args.test_hdf5}")
-    te_df = load_hdf5(args.test_hdf5)
+    print(f"Loading test parquet:  {args.test_parquet}")
+    # z_max is a training-time cut only -- test always evaluates on the full,
+    # uncut redshift distribution so σ_NMAD/outlier numbers reflect real-world
+    # performance (including any tail the model was never trained to handle),
+    # and so different --z-max training runs stay comparable against the same
+    # ground truth.
+    te_df = load_parquet_galaxies(args.test_parquet, z_max=None, label="test parquet")
 
     print(f"  Train {len(tr_df):,}  Val {len(val_df):,}  Test {len(te_df):,}")
 
@@ -549,8 +366,8 @@ def main():
     n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     print(f"Encoder trainable parameters: {n_enc:,}")
 
-    if args.init_from:
-        ckpt     = torch.load(args.init_from, map_location=args.device, weights_only=False)
+    if init_from:
+        ckpt     = torch.load(init_from, map_location=args.device, weights_only=False)
         src      = ckpt.get("model_state", ckpt.get("model_state_dict", ckpt))
         cur      = model.state_dict()
         matched  = {k: v for k, v in src.items()
@@ -558,7 +375,7 @@ def main():
         skipped  = set(src) - set(matched)
         cur.update(matched)
         model.load_state_dict(cur)
-        print(f"Warm-start: loaded {len(matched)}/{len(cur)} keys from {args.init_from}")
+        print(f"Warm-start: loaded {len(matched)}/{len(cur)} keys from {init_from}")
         if skipped:
             print(f"  Skipped (shape mismatch / new head): {sorted(skipped)}")
 
@@ -573,11 +390,12 @@ def main():
 
     best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     ckpt_path    = os.path.join(out_dir, "best.pt")
-    best_nmad_avg = float("inf")   # rolling-average σ_NMAD criterion
-    nmad_window   = []             # recent σ_NMAD values for rolling average
+    best_nmad_avg = float("inf")
+    nmad_window   = []
     patience_ctr  = 0
     patience      = args.patience if args.patience is not None else args.epochs // 5
     phase2_started = False
+    NMAD_AVG_WINDOW = 5
 
     history = {k: [] for k in [
         "tr_total", "tr_z_sup", "tr_recon", "tr_kl", "tr_log_sigma_z",
@@ -597,15 +415,19 @@ def main():
 
         # ── Phase transition ──────────────────────────────────────────────
         if epoch == args.warmup_epochs + 1 and not phase2_started:
+            # Snapshot the pure z-supervised state (vae_head still frozen/
+            # zero-init) before Phase 2 touches anything -- a clean fallback/
+            # warm-start anchor independent of best.pt's rolling-average
+            # tracking, and predating the historically more crash-prone
+            # reconstruction+KL fine-tuning (see PLAN.md Failure 13).
+            phase1_ckpt_path = os.path.join(out_dir, "phase1_end.pt")
+            model.save(phase1_ckpt_path, scaler=scaler, col_medians=col_med)
+            print(f"  Phase 1 end checkpoint (epoch {epoch - 1}) → {phase1_ckpt_path}")
             print(f"\n── Phase 2: joint fine-tuning "
                   f"(epoch {epoch}, vae_head unfrozen, "
                   f"trunk/z_head lr unchanged (cosine continues), "
                   f"vae lr ×{args.phase2_vae_lr_frac}) ──\n")
             model.encoder.unfreeze_vae_head()
-            # trunk/z_head/sigma_z_head LR is left as-is (no rescale) —
-            # vae_head's recon/KL gradient never reaches them (h.detach()/
-            # z_pred.detach() in the encoder), so there is nothing to protect
-            # them from here; only add vae_head as a new param group.
             opt.add_param_group({
                 "params":       list(model.encoder.vae_head.parameters()),
                 "lr":           args.lr * args.phase2_vae_lr_frac,
@@ -613,7 +435,7 @@ def main():
             })
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 opt, T_max=args.epochs - epoch + 1, eta_min=1e-6)
-            patience_ctr   = 0   # fresh patience budget for Phase 2
+            patience_ctr   = 0
             phase2_started = True
 
         # ── Loss weights for this epoch ───────────────────────────────────
@@ -628,8 +450,6 @@ def main():
 
         beta = min(BETA_MAX, BETA_MAX * kl_epoch / max(BETA_EPOCHS - 1, 1))
 
-        # λ_z drops at Phase 2 start to give VAE gradient budget,
-        # then restores linearly after β has stabilized.
         if epoch <= args.warmup_epochs:
             lam_z_eff = args.lam_z
         elif kl_epoch <= BETA_EPOCHS:
@@ -643,7 +463,8 @@ def main():
         lr_trunk = opt.param_groups[0]["lr"]
         lr_vae   = opt.param_groups[1]["lr"] if len(opt.param_groups) > 1 else None
 
-        t0 = time.time()
+        import time as _time
+        t0 = _time.time()
 
         tr_loss, tr_grad_stats = run_epoch(model, tr_loader,  args.device, opt=opt,
                              lam_z=lam_z_eff, lam_r=lam_r_eff, beta=beta,
@@ -665,7 +486,7 @@ def main():
         nmad = sigma_nmad(z_pred_val, z_val)
 
         sched.step()
-        dt = time.time() - t0
+        dt = _time.time() - t0
 
         for k in ("total", "z_sup", "recon", "kl", "log_sigma_z"):
             history[f"tr_{k}"].append(tr_loss[k])
@@ -682,7 +503,6 @@ def main():
                    for k in hist_keys]
             hf.write(f"{epoch}," + ",".join(row) + "\n")
 
-        # Rolling-average σ_NMAD: smooths per-epoch noise from small val set (677 gal).
         nmad_window.append(nmad)
         if len(nmad_window) > NMAD_AVG_WINDOW:
             nmad_window.pop(0)
@@ -738,7 +558,7 @@ def main():
     print(f"  RMS     : {rms_te:.4f}")
     print(f"  f_cat   : {fcat_te*100:.2f}%")
 
-    report_quality_cut_metrics(dz_te, z_te, z_std_te)
+    # report_quality_cut_metrics(dz_te, z_te, z_std_te)
 
     # ── Save predictions ──────────────────────────────────────────────────
     pred_path = os.path.join(out_dir, "test_predictions.csv")
@@ -828,16 +648,16 @@ def main():
 
         # ── Paper-style figures (density scatter + binned metrics) ────────
         plot_scatter_density(z_te, z_pred_te,
-                             os.path.join(out_dir, "dp1_v4_test_scatter.png"))
+                             os.path.join(out_dir, "test_scatter_density.png"))
         plot_metrics_binned_3sig(z_te, dz_te,
                                   bins=np.arange(0.0, 3.2, 0.2),
                                   xlabel=r"$z_{\rm spec}$",
-                                  save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_z.png"))
+                                  save_path=os.path.join(out_dir, "test_metrics_vs_z_binned.png"))
         _ref_mag_col = GAAP_REF_MAG if use_gaap else REF_MAG
         plot_metrics_binned_3sig(te_df[_ref_mag_col].values, dz_te,
                                   bins=np.arange(18.0, 25.5, 0.5),
                                   xlabel="Magnitude",
-                                  save_path=os.path.join(out_dir, "dp1_v4_test_metrics_vs_mag.png"))
+                                  save_path=os.path.join(out_dir, "test_metrics_vs_mag.png"))
 
     print(f"\nDone. Best avg σ_NMAD={best_nmad_avg:.4f}")
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] Training finished")

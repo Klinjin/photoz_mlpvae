@@ -1,0 +1,29 @@
+Train: photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probe_activations_train.npz (6,101)
+Test:  photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probe_activations_test.npz (2,905)
+
+Fitting 19 targets x 11 layers (209 probes)...
+  z (redshift)           x=0.391, h0=0.595, h1_mid=0.589, h1=0.555, h2_mid=0.562, h2=0.566, z_head_hidden=0.551, z_out=0.551, mu_15=0.532, log_spec=0.420, m_ab_recon=0.175
+    (z sigma_NMAD)       x=0.1741, h0=0.0830, h1_mid=0.1042, h1=0.1167, h2_mid=0.0753, h2=0.0693, z_head_hidden=0.0538, z_out=0.0397, mu_15=0.0899, log_spec=0.0507, m_ab_recon=0.2897
+  log σ_z (model uncertainty) x=0.539, h0=0.694, h1_mid=0.741, h1=0.790, h2_mid=0.815, h2=0.897, z_head_hidden=0.966, z_out=1.000, mu_15=0.672, log_spec=0.791, m_ab_recon=0.474
+  i magnitude            x=1.000, h0=0.998, h1_mid=0.980, h1=0.990, h2_mid=0.909, h2=0.985, z_head_hidden=0.723, z_out=0.551, mu_15=0.733, log_spec=0.641, m_ab_recon=0.817
+  g−r color              x=1.000, h0=0.999, h1_mid=0.972, h1=0.992, h2_mid=0.919, h2=0.986, z_head_hidden=0.581, z_out=0.132, mu_15=0.844, log_spec=0.133, m_ab_recon=0.674
+  logmass                x=0.230, h0=0.670, h1_mid=0.731, h1=0.777, h2_mid=0.848, h2=0.942, z_head_hidden=0.841, z_out=0.712, mu_15=0.953, log_spec=0.946, m_ab_recon=0.381
+  logzsol                x=0.143, h0=0.478, h1_mid=0.523, h1=0.608, h2_mid=0.712, h2=0.920, z_head_hidden=0.680, z_out=0.433, mu_15=0.915, log_spec=0.997, m_ab_recon=0.644
+  dust2                  x=0.516, h0=0.829, h1_mid=0.918, h1=0.944, h2_mid=0.875, h2=0.856, z_head_hidden=0.721, z_out=0.300, mu_15=0.998, log_spec=0.988, m_ab_recon=0.545
+  dust1_fraction         x=0.068, h0=0.062, h1_mid=0.345, h1=0.320, h2_mid=0.420, h2=0.512, z_head_hidden=0.289, z_out=0.002, mu_15=0.709, log_spec=-0.393, m_ab_recon=0.147
+  dust_index             x=0.886, h0=0.980, h1_mid=0.971, h1=0.987, h2_mid=0.895, h2=0.993, z_head_hidden=0.554, z_out=0.246, mu_15=0.940, log_spec=1.000, m_ab_recon=0.749
+  gas_logz               x=0.316, h0=0.865, h1_mid=0.679, h1=0.790, h2_mid=0.767, h2=0.923, z_head_hidden=0.219, z_out=0.085, mu_15=0.841, log_spec=-0.715, m_ab_recon=0.092
+  fagn                   x=0.097, h0=0.322, h1_mid=0.441, h1=0.524, h2_mid=0.587, h2=0.787, z_head_hidden=0.642, z_out=0.196, mu_15=0.866, log_spec=0.560, m_ab_recon=0.322
+  agn_tau                x=0.089, h0=0.306, h1_mid=0.222, h1=0.252, h2_mid=0.270, h2=0.206, z_head_hidden=0.132, z_out=0.002, mu_15=0.244, log_spec=0.110, m_ab_recon=-0.005
+  igm_scale              x=0.212, h0=0.413, h1_mid=0.518, h1=0.592, h2_mid=0.662, h2=0.854, z_head_hidden=0.809, z_out=0.701, mu_15=0.984, log_spec=0.681, m_ab_recon=0.317
+  logsfr_ratios_0        x=0.221, h0=0.598, h1_mid=0.654, h1=0.678, h2_mid=0.778, h2=0.881, z_head_hidden=0.795, z_out=0.788, mu_15=0.967, log_spec=0.986, m_ab_recon=0.298
+  logsfr_ratios_1        x=0.139, h0=0.392, h1_mid=0.372, h1=0.467, h2_mid=0.522, h2=0.620, z_head_hidden=0.555, z_out=0.329, mu_15=0.888, log_spec=0.710, m_ab_recon=0.185
+  logsfr_ratios_2        x=0.406, h0=0.649, h1_mid=0.669, h1=0.715, h2_mid=0.790, h2=0.891, z_head_hidden=0.710, z_out=0.507, mu_15=0.976, log_spec=0.872, m_ab_recon=0.396
+  logsfr_ratios_3        x=0.629, h0=0.827, h1_mid=0.858, h1=0.898, h2_mid=0.892, h2=0.956, z_head_hidden=0.742, z_out=0.150, mu_15=0.982, log_spec=0.980, m_ab_recon=0.497
+  logsfr_ratios_4        x=0.525, h0=0.823, h1_mid=0.858, h1=0.890, h2_mid=0.948, h2=0.981, z_head_hidden=0.867, z_out=0.823, mu_15=0.998, log_spec=0.994, m_ab_recon=0.350
+  logsfr_ratios_5        x=0.131, h0=0.476, h1_mid=0.516, h1=0.602, h2_mid=0.688, h2=0.908, z_head_hidden=0.640, z_out=0.252, mu_15=0.995, log_spec=0.815, m_ab_recon=0.497
+
+Saved photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probes/probe_r2.csv
+Saved photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probes/probe_r2_redshift.png
+Saved photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probes/probe_r2_photometry.png
+Saved photoz_mlpvae/representation/mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20/probes/probe_r2_sps_params.png

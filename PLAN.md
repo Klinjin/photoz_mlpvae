@@ -8,6 +8,46 @@ architecture and usage, see [README.md](README.md).
 
 ## Changelog (moved from README.md, newest first, metric-moving changes only)
 
+- `mlpvae_dp2_v3_lsst_gaap1p0` completed (600/600 epochs, no NaN, warm-started from a synth
+  checkpoint retrained against the new z<=6.5 Inoue speculator, Failure 13 round 4): test
+  σ_NMAD=0.0410, bias=0.0704, outliers=14.93%, RMS=0.3176, f_cat=17.72%, quality-cut @70%
+  σ_NMAD=0.0264 — statistically indistinguishable from dp2_v2 (0.0408/0.0657/.../0.0264). The new
+  speculator's z<=6.5 coverage produced no measurable improvement: it only helps the z>5.5 tail,
+  which is 8/17,278 galaxies in this test set — too small to move aggregate metrics.
+- `mlpvae_dp2_v2_lsst_gaap1p0` completed (600/600 epochs, no NaN, Failure 13
+  round 3 — reduced-epoch schedule + `_LATENT_CLAMP` + widened SPS ranges +
+  quality-cut reporting): test σ_NMAD=0.0408, bias=0.0657, outliers=14.63%,
+  RMS=0.3046, f_cat=17.54% — **matches dp2_v1's 2000-epoch quality in 3.9h
+  vs. 14.5h (3.7× less wall-clock)**, confirming the schedule-mismatch
+  hypothesis. Quality-cut (70% retention by lowest predicted σ_z): σ_NMAD
+  **0.0264**, bias **0.0040**, outliers 3.02% — beats DP1's promoted best
+  (σ_NMAD 0.0298) on the confident majority. Spike pattern: 52 occurrences
+  over the full run (vs. dp2_v1's 102) but a *higher* per-100-epoch rate
+  (8.67 vs. 5.10) — the `_LATENT_CLAMP` bounds severity (max 14,222 vs.
+  17,700) and the window closes slightly earlier as a schedule fraction
+  (45.0% vs. 52.2%), but does not reduce spike frequency; see Failure 13.
+- `mlpvae_dp2_v1_lsst_gaap1p0` completed (2000/2000 epochs, no NaN, DP2,
+  Failure 13 rounds 1+2 held for the full run): test σ_NMAD=0.0402,
+  bias=0.0696, outliers=14.63%, RMS=0.3120, f_cat=17.56% — but the
+  1000→2000-epoch stretch only bought ~9% of that for half the ~13.3h
+  wall-clock, and calibration (PIT) never converged; see Failure 13 round 3
+  for the follow-up fixes.
+- `_ZRED_MAX_SPEC` 6.5→8.5 + `_ZRED_SIGMA_FLOOR` 1e-4→1e-3 (`model/photoz_mlpvae.py`,
+  DP2, Failure 13 round 2): recurring validation-loss blowup ceiling
+  816,871 → **14,067** (58×), no NaN recurrence in a 39-epoch smoke test spanning
+  Phase 2. Shared file — also changes inference-time `z_pred` scaling for
+  existing "new"-model checkpoints trained under the old constant; see Open
+  Problems.
+- `log_var_z`/`log_var_15` clamp(-6.0, 4.0) re-enabled (`model/photoz_mlpvae.py`,
+  DP2, Failure 13 round 1): fixed a NaN crash at epoch 104/2000 (z-supervised
+  Phase 1); pre-crash checkpoint already scored σ_NMAD=0.0447 on the DP2 SOM
+  test set from warmup alone, before any VAE fine-tuning.
+- New `train_dp2.py` script: loads DP2 SOM-matched parquet catalogs directly
+  (not pre-split HDF5); z_max A/B test on the training-only redshift cut found
+  no bulk-metric cost either way (σ_NMAD 0.0424 no-cut vs 0.0411 cut-at-5.5 on
+  an identical, always-uncut test set) — the z>5.5 tail is a 100%
+  catastrophic-outlier population regardless of training exposure. See
+  Experiment log.
 - Epochs×LR sweep + `lam_z_min=20` (bias campaign, see Open Problems):
   promoted `mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20` as new best —
   σ_NMAD 0.0348 → **0.0298**, bias 0.0559 → **0.0244**, RMS 0.3012 → 0.2514.
@@ -51,6 +91,59 @@ architecture and usage, see [README.md](README.md).
 ---
 
 ## Open problems
+
+### Model-constant changes are not saved in existing checkpoints — old "new"-model checkpoints will predict/decode differently now
+
+`_ZRED_MAX_SPEC`, `_ZRED_SIGMA_FLOOR`, `_LATENT_CLAMP`, and each
+`constrain_params_15` physical range are module-level constants in
+`model/photoz_mlpvae.py`, not part of `PhotozMLPVAE.save()`'s payload or
+`encoder_config` — only `n_in`, `width`, `n_latent` are saved. Every one of
+these has now changed at least once (Failure 13, DP2):
+  - `_ZRED_MAX_SPEC` 6.5→8.5 (round 2): `z_pred = sigmoid(mu_z) ×
+    _ZRED_MAX_SPEC` now scales every existing "new"-model checkpoint's
+    raw-space `mu_z` by the new constant at inference time, not the constant
+    it was *trained* under.
+  - `_LATENT_CLAMP` (±15 on `mu_z`/`z_raw`/`mu_15`/`z_raw_15`) and all 15
+    `constrain_params_15` ranges widened (round 3 / dp2_v2): change how any
+    existing checkpoint's raw latents map to physical SPS parameters and
+    decoder input, on top of the above.
+
+Concretely: `mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20` (current best, DP1,
+σ_NMAD 0.0298) was trained under the *original* constants throughout; loading
+it today and calling `predict_z`/`predict_params`/`decode` will **not**
+reproduce its originally reported numbers, because the same raw latents now
+map to systematically different physical values at every one of the changed
+transforms. `--model-version old` and `mdn` checkpoints are unaffected
+(separate files, unchanged constants).
+
+**Status**: open, unconfirmed how large the shift is in practice (likely
+small for well-converged predictions away from any transform's saturation
+tails, larger near the old boundaries). Not yet mitigated. Candidate fix:
+save all of `zred_max_spec` / `sigma_floor` / `latent_clamp` / the SPS range
+parameters into `encoder_config` at `save()` time and thread them through
+`PhotozMLPVAE.__init__`/`load()` (defaulting to each constant's
+pre-Failure-13 value when absent, for backward compatibility with existing
+`.pt` files). Until fixed, re-evaluating any pre-2026-08-11 "new"-model
+checkpoint's test metrics with current code will not match its originally
+reported numbers.
+
+**Update 2026-08-12 — the frozen-decoder half of this problem hit and was
+fixed.** The Inoue zmax-6.5 speculator retrain replaced
+`speculator/trained/Inoue_IGM`'s `model.npz`/`pca_basis.npz` on disk with
+different PCA dimensionalities (e.g. band 0: 30→90 components, band 1:
+20→30), so `SpeculatorInoueIGM.__init__` began building buffers whose
+shapes no longer match any pre-retrain checkpoint's saved `state_dict` —
+`PhotozMLPVAE.load()` crashed with a 10-buffer size mismatch on every
+existing "new"-model checkpoint (first hit by the representation study's
+re-extraction). **Fix** (`model/photoz_mlpvae.py::load`): shape-mismatched
+frozen-decoder buffers are re-registered to the checkpoint's own tensors
+before `load_state_dict`, with a printed NOTE — checkpoints now decode
+with the exact decoder they were trained against, regardless of what is
+currently on disk. This resolves the decoder-*weights* part of this open
+problem (weights were always saved, now they also win); the module-level
+*constants* part above remains open. `photoz_mlpvae_old.py`/`_mdn.py` have
+their own `load()` implementations and would need the same treatment if
+old/mdn checkpoints are loaded after the retrain.
 
 ### Target σ_NMAD ~2×10⁻² / bias ~10⁻³ not reachable via epochs×LR alone (z-separated model)
 
@@ -524,6 +617,317 @@ never by editing source in place.
 
 ---
 
+### Failure 13 — DP2 z-supervised NaN crash: σ_z collapses to ~0 via two independent mechanisms (2026-08-11)
+
+**Symptom (round 1)**: first full `train_dp2.py` run
+(`mlpvae_dp2_v1_lsst_gaap1p0`: 2000 epochs, batch 256, lr 1e-3,
+`--model-version new`, GAAP, LSST-only, synth warm-start from
+`mlpvae_synth_zsep_v1_no_euclid_gaap1p0/best.pt`, `--z-max 0`) crashed with
+NaN at epoch 104, still inside the 200-epoch Phase-1 z-supervised warmup —
+never reached Phase 2. For ~40 epochs before the fatal one, isolated epochs
+showed the validation loss spike to a near-constant ~816,870 (`z_sup`
+component ~40,843) — recurring at the same magnitude because `val_loader` is
+not shuffled, so the same problem galaxy lands in the same batch position
+each epoch.
+
+**Root cause (round 1)**: `model/photoz_mlpvae.py`'s `MLPVAEEncoder.forward()`
+computed `log_var_z` (and `vae_head`'s `log_var_15`) with their
+`.clamp(-6.0, 4.0)` calls commented out. Without a floor, `σ_z` (via
+`_zred_sigma_phys`) could collapse toward the code's existing
+`_ZRED_SIGMA_FLOOR` for a hard galaxy, and the NLL's `1/σ_z²` term amplified
+that galaxy's squared error into the ~816,870 spike. Eventually a `nan`
+gradient appeared; gradient-norm clipping cannot rescue an already-`nan`
+gradient (any finite scale factor times `nan` is still `nan`), so it
+poisoned the weights.
+
+**Fix (round 1)**: re-enabled both clamps
+(`model/photoz_mlpvae.py:275,285`). Despite crashing at epoch 104/2000, the
+pre-crash checkpoint (epoch 101, avg σ_NMAD=0.0691) already scored test
+σ_NMAD=0.0447, bias=0.0534, outliers=14.55%, RMS=0.2842, f_cat=16.21% on the
+DP2 SOM test set, purely from z-supervised warmup with no VAE fine-tuning at
+all.
+
+**Symptom (round 2)**: relaunched with the round-1 fix; ran cleanly through
+Phase 2's start (epoch 201) to epoch 458/2000 (best avg σ_NMAD=0.0629 @ epoch
+446) before the **same** blowup magnitude (val=816,871, z_sup=40,843)
+reappeared.
+
+**Root cause (round 2)**: the log_var_z clamp bounds only one factor. `σ_z`
+is actually `_zred_sigma_phys(mu_z, log_var_z) = σ_raw × _ZRED_MAX_SPEC ×
+s(1−s)`, `s = sigmoid(mu_z)` — a delta-method Jacobian that collapses toward
+zero whenever the predicted redshift **saturates** near 0 or
+`_ZRED_MAX_SPEC`, independent of the log_var_z clamp. The existing
+`_ZRED_SIGMA_FLOOR=1e-4` floor was loose enough that `1/σ_z²` could still
+reach ~1e8. DP2's test set has spec-z up to 8.275 while `_ZRED_MAX_SPEC` was
+only 6.5 (round-1 value, unchanged from the pre-DP2 default) — so those
+high-z galaxies are an **unreachable target**: training keeps pushing `mu_z`
+toward the saturation boundary trying (and failing) to get closer, which is
+exactly what triggers the Jacobian collapse. This connects to the z_max A/B
+test in the Experiment log below: the z>5.5 tail is unlearnable regardless of
+training exposure, but *excluding* it from training (as `--z-max 5.5` does)
+doesn't stop the model from also seeing tail-adjacent examples that still
+push toward saturation — raising the ceiling was the fix, not the exclusion.
+
+**Fix (round 2)**:
+1. `_ZRED_MAX_SPEC`: 6.5 → **8.5** (`model/photoz_mlpvae.py`) — gives
+   `z_pred` headroom above DP2's highest test-set spec-z so those galaxies
+   are no longer a saturating/unreachable target.
+2. `_ZRED_SIGMA_FLOOR`: 1e-4 → **1e-3** — caps `1/σ_z²` two orders of
+   magnitude lower, still well under the ~2×10⁻²(1+z) photo-z precision
+   floor these models target.
+3. Updated several stale docstring/comment mentions of the old "5.5"/"6.5"
+   cap throughout `model/photoz_mlpvae.py` to reference `_ZRED_MAX_SPEC`
+   symbolically instead of a hardcoded number, so documentation can't drift
+   out of sync with the constant again (this drift is also how round 2's
+   mechanism got missed initially — several docstrings already said "5.5"
+   when the real pre-fix value was 6.5).
+
+A 39-epoch smoke test (18 of them in Phase 2) confirmed zero NaN in training
+loss, and the same recurring validation-batch spike is now bounded to
+~14,046–14,067 (`z_sup`≈702–703) instead of ~816,870+ — a ~58× reduction —
+staying flat/bounded on repeat occurrences rather than growing toward NaN.
+
+**Round 2 relaunch (`mlpvae_dp2_v1_lsst_gaap1p0`) completed successfully**:
+ran the full 2000/2000 epochs, zero NaN, zero early-stop. The bounded spike
+recurred through ~epoch 950 (15–36 occurrences per 200-epoch window, max
+17,700 at epoch 468 — a bit above the smoke test's ~14,067 estimate but
+never growing) then **stopped entirely for the remaining ~1,050 epochs**.
+Final: σ_NMAD=0.0402, bias=0.0696, outliers=14.63%, RMS=0.3120, f_cat=17.56%.
+
+**Post-completion analysis of `history.csv` + diagnostic plots found two
+things round 2's fix didn't cover:**
+
+1. **A second, distinct instability mechanism** — two *training*-loss
+   spikes (not just val), ~7,000–7,500, at epochs ~1400/1430, coincident
+   with a KL-divergence hump (val KL 11→25 over the same window, visible in
+   `train_curves.png`). Round 1 clamped `log_var_15` but never `mu_15`
+   itself, and KL's `mu_15²` term has no ceiling without one — an
+   unclamped `mu_15` excursion is the likely culprit, a KL-side analog of
+   round 2's z-side Jacobian-collapse mechanism.
+2. **Epoch/warmup schedule was inherited from DP1 without accounting for
+   dataset size.** DP2 has ~1,770 batches/epoch vs. DP1's ~24 (this
+   recipe's epoch counts were tuned on DP1's much smaller set) — so
+   dp2_v1's 200-epoch warmup alone was ~354k gradient steps, more than
+   DP1's *entire* 2000-epoch schedule (~48k steps). Consistent with that:
+   rolling-avg σ_NMAD hit 0.0637 by epoch 500 vs. 0.0555 final at epoch
+   1905 (~13% gap) while the epoch-1000→2000 stretch consumed half the
+   ~13.3h wall-clock for a further ~9% gain. `mean log σ_z` also declined
+   continuously through all 2000 epochs without plateauing, and the test
+   PIT plot confirmed resulting overconfidence (S-curve, ΔQ≈−0.15 near
+   PIT~0.8) — calibration never converged either.
+
+(A per-`survey`-column breakdown of test residuals was also run as part of
+this analysis, since COSMOS2020_CLASSIC/JADES_DR5_PHOTOZ — 37%/0.4% of the
+training set — are themselves photometric-redshift catalogs, not true
+spec-z, and score far worse (σ_NMAD 0.06–0.23) than the genuine spec-z
+surveys (COSMOS_SRC alone: σ_NMAD 0.0203, better than DP1's promoted
+checkpoint). **This was considered and set aside as a DP2-vs-DP1 root cause
+per user correction**: DP1's own training data also mixes photo-z and
+grism-z, so this heterogeneity isn't unique to DP2 and doesn't explain the
+DP1/DP2 gap. Left here only so the breakdown isn't silently re-derived
+later.)
+
+**Round 3 fix (`mlpvae_dp2_v2_lsst_gaap1p0`, 2026-08-12)**:
+1. `MAX_EPOCHS`: 2000 → **600** (`scripts/train_dp2.py`) — recalibrated
+   from dp2_v1's own observed learning curve (diminishing returns past
+   roughly epoch 500), not from DP1's step count.
+2. `_LATENT_CLAMP = 15.0` (`model/photoz_mlpvae.py`) applied to `mu_z`,
+   the reparameterized `z_raw`, `mu_15`, and the reparameterized
+   `z_raw_15` — generous enough that sigmoid/tanh are already saturated
+   well before it (no effect on normal training dynamics), addressing the
+   KL blowup mechanism above directly (`mu_15` is now bounded) and adding
+   a second line of defense on the z-side Jacobian-collapse mechanism.
+3. All 15 `constrain_params_15` physical ranges widened past the original
+   synthetic-SED-generation prior (e.g. logmass [7,12.5]→[6.5,13.0]) — the
+   same accepted extrapolation tradeoff already made for zred (5.5→8.5):
+   the frozen Speculator decoder may extrapolate past its own training
+   range, but this only affects `vae_head`'s reconstruction gradient, not
+   the z branch. See `constrain_params_15`'s own comment for the full
+   old→new table.
+4. Added `report_quality_cut_metrics()` (shared by `train_dp1.py` and
+   `train_dp2.py`, defined in the former) — reports headline metrics on the
+   most-confident-by-σ_z 70% of the test set alongside the full-sample
+   numbers. **Provenance correction**: this was initially described as
+   reusing "DP1's validated approach," which overstated it — this exact
+   function is new code, never run against a real DP1 checkpoint before
+   today. PLAN.md's Open Problems mentions a one-off σ_z-cut measurement
+   (baseline 70% retention → σ_NMAD 0.0202) from an *unresolved* bias-
+   campaign investigation, computed ad hoc and never turned into reusable
+   pipeline code — treat that number as one exploratory data point, not
+   as evidence this implementation reproduces it.
+5. `phase1_end.pt` (added earlier, unaffected by this round) retained
+   deliberately: saves the pure z-supervised checkpoint at the Phase 1→2
+   boundary, for post-hoc MLP-only vs. MLP+VAE representation comparison
+   via `scripts/extract_activations.py` / `scripts/fit_linear_probes.py`.
+
+Also see the new Open Problems entry: every constant touched in rounds
+2–3 (`_ZRED_MAX_SPEC`, `_ZRED_SIGMA_FLOOR`, `_LATENT_CLAMP`, all 15 SPS
+ranges) is unsaved in existing checkpoints, so pre-2026-08-11 "new"-model
+checkpoints (including the DP1 zsep_v4 promoted best) will not reproduce
+their originally reported numbers under current code.
+
+**Status**: `mlpvae_dp2_v2_lsst_gaap1p0` completed (600/600 epochs, no NaN,
+2026-08-12, 3.9h wall-clock). Confirms the schedule-mismatch hypothesis:
+matches dp2_v1's quality (σ_NMAD 0.0408 vs. 0.0402, bias 0.0657 vs. 0.0696)
+in 3.7× less wall-clock (600 vs. 2000 epochs). Quality-cut at 70% retention:
+σ_NMAD 0.0264, bias 0.0040 — beats DP1's promoted best on the confident
+majority. The `_LATENT_CLAMP`/widened-range fix does **not** reduce spike
+*frequency* (52 occurrences over the full run at 8.67/100 epochs, vs.
+dp2_v1's 102 at 5.10/100 epochs — a higher rate, though the run is 3.3×
+shorter so this may partly reflect Phase 2 (the spikier phase) occupying a
+larger fraction of a shorter schedule); it does cap severity a bit lower
+(max 14,222 vs. 17,700) and the window closes slightly earlier as a
+schedule fraction (45.0% vs. 52.2%). Still zero NaN in either full run.
+
+**Round 4 (`mlpvae_dp2_v3_lsst_gaap1p0`, 2026-08-12, in progress)**: user judged dp2_v2 still
+not good enough and requested a retrain against the newly-retrained Inoue speculator (a parallel
+effort, `speculator/retrain_inoue_zmax6p5.log`): the Inoue-IGM SED training set was regenerated
+with `ZMAX` raised 5.5→6.5 (2M train + 100k val SEDs, ~15% now at z>5.5) and the frozen Speculator
+retrained on GPU against it (new PCA search: n_pcas 90/30/20, far-UV band jumped 30→90 for the
+extended-z IGM diversity). Files replaced in place
+(`sed_generation/data/sed_{train,val}.h5`, `speculator/trained/Inoue_IGM/`), and
+`SpeculatorBand`/`SpeculatorInoueIGM` (`photoz_vae/model/speculator_torch.py`) load all NN/PCA
+shapes dynamically from disk, so no photoz_mlpvae code needed changes to pick up the new decoder.
+This matters here because `_ZRED_MAX_SPEC=8.5` (Failure 13 round 2) was extrapolating the decoder
+2.5x past its old z<=5.5 training range for DP2's high-z galaxies; with the new z<=6.5 decoder
+that extrapolation gap shrinks to 6.5->8.5 (encoder-side z_head range is unaffected either way —
+`_ZRED_MAX_SPEC` still governs what target redshifts are "reachable" during training, unrelated to
+the decoder's own SED-generation range). The 15 SPS-parameter range widenings from round 3 remain
+just as extrapolative as before — only ZMAX changed in the SED regen, not the other SPS priors.
+
+Sequence: (1) re-ran `train_synth.py` fresh (same recipe as `mlpvae_synth_zsep_v1`: 500 epochs,
+`--use-gaap --no-euclid --model-version new`) since the old warm-start checkpoint was pretrained
+against the stale decoder — reusing it would warm-start the encoder to decode through a
+speculator it was never matched to. New checkpoint `mlpvae_synth_zsep_v2_no_euclid_gaap1p0`:
+best avg σ_NMAD=0.0201 (vs. v1's 0.0187 — comparable, slightly higher, consistent with a harder,
+wider-z-range pretraining prior), took ~20 min (vs. v1's ~67 min — likely just less GPU
+contention this time, not attributable to the new data/decoder). (2) Updated
+`train_dp2.py`'s `SYNTH_INIT_CKPT` to point at the new checkpoint. (3) Launched dp2_v3 (PID
+674211, GPU0) with the same recipe as dp2_v2 otherwise (600 epochs, `_LATENT_CLAMP`, widened SPS
+ranges, quality-cut reporting) — warm-start loaded 127/128 keys cleanly (same single
+input-layer shape mismatch as always). In progress as of this note.
+
+**Gotcha for future runs**: launching via `nohup ... > file 2>&1 &` makes Python treat stdout as
+non-interactive and fully-buffer it, so the shell-redirected launch log can sit empty for many
+minutes even while training is actively progressing — always check the script's own `train.log`
+(written by `_Tee`, line-buffered) inside the output directory instead of the launch log for
+live progress.
+
+**Round 4 result**: `mlpvae_dp2_v3_lsst_gaap1p0` completed (600/600 epochs, no NaN, 3.2h,
+2026-08-12 19:09→22:22). Test σ_NMAD=0.0410, bias=0.0704, outliers=14.93%, RMS=0.3176,
+f_cat=17.72%. Quality-cut @70% retention (computed post-hoc from `test_predictions.csv` since
+the `report_quality_cut_metrics()` call was commented out in this run): σ_NMAD=**0.0264**
+(identical to dp2_v2's), bias=0.0047, outliers=3.23%, f_cat=9.38%.
+
+**Conclusion: the new z<=6.5 speculator produced no measurable improvement over dp2_v2.** All
+three dp2 runs (v1/v2/v3) are statistically indistinguishable — differences sit within the
+unseeded-weight-init noise band already documented elsewhere in this file. In hindsight this is
+expected: the speculator retrain only improves reconstruction quality for the z>5.5 tail, and
+this DP2 SOM-matched test set has only 8/17,278 galaxies above z=5.5 (see the z_max A/B test
+above) — far too small a population to move aggregate σ_NMAD/bias/outliers, which are dominated
+by the bulk z<2 population where the decoder swap changes nothing. The synth-pretrain warm-start
+refresh (`mlpvae_synth_zsep_v2_no_euclid_gaap1p0`) was still the methodologically correct thing
+to do given the new decoder (round 3's checkpoint would have been decoder-mismatched), it just
+didn't move this particular metric. If further improvement is wanted, the more promising
+untried levers are still the ones from the original post-dp2_v1 analysis: `mu_15`/split-gradient
+clipping refinement, σ_z calibration (PIT never converges), or the low-z→high-z outlier
+population (per-galaxy quality cuts already help substantially — 0.0410→0.0264 — but the
+uncut aggregate number is what's plateauing across all three architecture-level fixes tried).
+
+---
+
+### Failure 14 — Linear-probe held-out R² of −26: near-dead train dims explode under the train-fit StandardScaler (`scripts/fit_linear_probes.py`, fixed 2026-08-12)
+
+**Context**: first run of the representation-study probe battery
+(`extract_activations.py` → `fit_linear_probes.py`) on the promoted
+`mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20`, dp1_v4 train→test. Study docs
+and results live in `representation/README.md`.
+
+**Symptom**: several (layer, target) cells returned wildly negative held-out
+R² — `h2`→logzsol −17.6, `h2`→fagn −25.9, `h2`→igm_scale −18.5,
+`h2`→logmass −5.5, plus negative log σ_z probes from h0/h1 — while the same
+cells refit *test-internally* scored sanely (`h2`→logmass +0.80). The z row
+also looked implausibly weak everywhere (~0.5) for a model with
+σ_NMAD 0.030.
+
+**Root cause (two independent issues)**:
+1. **Scaler blow-up on dims dead-on-train but alive-on-test.** Post-ReLU
+   activation dims the training split never lights up (train std ~1e-12)
+   do activate on test: `h2` had 11 dims with test/train std ratio > 10
+   (max **3×10⁹**); `z_head_hidden` has 84/128 dims dead on train.
+   `StandardScaler` fit on train divides by the tiny train std, so on test
+   those dims reach thousands of "train-σ" and even a small ridge
+   coefficient explodes the prediction. Widening the alpha grid to 1e8 did
+   not help — train-side CV never sees the explosion (the dims are
+   unit-variance on train after scaling), so the chosen alpha stayed 1e2.
+2. **R² on redshift is catastrophic-outlier-dominated.** The model's *own*
+   z_pred scores R² = 0.26 on dp1_v4 test despite σ_NMAD = 0.030 (train:
+   0.64), so R² alone misranks layers on the z target — not a probe bug,
+   but it made the z row uninterpretable.
+
+**Fix** (`scripts/fit_linear_probes.py::fit_and_score`):
+1. Drop activation dims whose train std < 1e-6 × the layer's median dim-std.
+2. Clip scaled features to ±10 train-σ on both splits (catches the
+   moderate-ratio dims the drop threshold misses).
+3. New `sigma_nmad` CSV column — robust scatter of the probe's predictions,
+   reported for the `z_true` target alongside R².
+
+Post-fix battery is coherent and passes its sanity checks: log σ_z probes
+at R² 0.967 from `z_head_hidden` (it *is* a linear readout of that layer);
+i mag and g−r probe at 1.000 from the input features; every previously
+exploding cell landed at a plausible positive value (`h2`→logmass 0.948).
+First probe results and takeaways: `representation/README.md`.
+
+---
+
+### Decoder-step probe degradation: analyzed, NOT a training pathology (representation study, 2026-08-12)
+
+**Question raised**: the probe battery on
+`mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20` shows z decodability collapsing
+at the final probed layer, the frozen decoder's output `m_ab_recon` (probe
+σ_NMAD 0.090 at `mu_15` → 0.290 at `m_ab_recon`, worse than raw input
+photometry's 0.174; most SPS params drop to R² 0.1–0.6). Does this mean the
+z estimation was confused during training by the m_AB reconstruction from
+the frozen decoder?
+
+**Conclusion: no, on three independent grounds.**
+
+1. **Probe geometry** — `m_ab_recon` is *downstream* of the prediction
+   (`theta_full = [z_pred, theta_15]` → frozen Speculator → FilterConv);
+   the z estimate is read out at the z head, so nothing at the decoder step
+   can affect it. The drop measures the forward physics: collapsing 16
+   physical parameters into 10 broadband magnitudes is strongly nonlinear
+   and many-to-one (color–redshift, dust–age–metallicity degeneracies), so
+   z stops being *linearly* readable — the probe is quantifying exactly the
+   degeneracy the encoder exists to invert. `m_ab_recon` probing below `x`
+   is also expected: `x` carries 24 engineered features incl. per-band
+   errors and missingness flags; `m_ab_recon` is 10 noiseless model
+   magnitudes carrying the VAE's own reconstruction error.
+2. **Architecture** — `vae_head` reads `[h.detach(), z_pred.detach()]` and
+   the decoder is frozen, so the reconstruction/KL gradient is identically
+   zero on the trunk and z head; recon trains only `vae_head`'s linear
+   layer. The one coupling runs the other way (a wrong `z_pred` worsens
+   reconstruction, and `theta_15` compensates) and never reaches the z
+   branch. This isolation was baked in *because* the old model demonstrably
+   had recon→trunk contamination (Failure 4c).
+3. **Training history** — in the rerun's `history.csv`, recon ramps on at
+   epoch 200 and val σ_NMAD improves straight through the transition (mean
+   0.0455 over epochs 170–199 → 0.0433 over 200–229), with the best epoch
+   at 1426, deep in Phase 2. No Failure-6-style val z-NLL oscillation at
+   Phase 2 start.
+
+**What would have been concerning instead**: a z-decodability drop at `h2`
+or `mu_15` (upstream/parallel to the z readout) — not observed (σ_NMAD
+0.069 / 0.090). **Corollary finding**: the reconstructed photometry is not
+a sufficient statistic for redshift, so the reconstruction objective alone
+cannot carry z — consistent with the photoz_vae v12 no-zsup ablation
+(σ_NMAD 0.42). The recon term earns its keep by shaping the SED latent,
+not by transporting z information. **Follow-up**: run the same battery on
+an old-model (`--model-version old`, undetached trunk) checkpoint, where
+recon contamination *should* be visible in the probe curves.
+
+---
+
 ## Experiment log
 
 > **Checkpoint cleanup (2026-08-04):** all `trained/` model directories that
@@ -571,3 +975,44 @@ Warm-start ("synth_zsep") = `mlpvae_synth_zsep_v1_no_euclid_gaap1p0/best.pt`
 | ~24 sweep/lever trials (scratch only) | 08-03/04 | 1500–4000 | 5e-5–3e-3 | 10% | no | 2.0 | best 0.0291 | best 0.0244 | see Open problems |
 | **mlpvae_zsep_v4_lsst_gaap1p0_e2000_lzmin20** | 08-04 | 2000 | 1e-3 | 200 | no | 2.0 | **0.0298** | **0.0244** | promoted trial (lam_z_min=20); best saved LSST-only |
 | **mlpvae_zsep_v4_euclid_gaap1p0_e2000_lzmin20** | 08-04 | 2000 | 1e-3 | 200 | no | 2.0 | 0.0317 | 0.0329 | +Euclid, native-init (`mlpvae_synth_zsep_v1_euclid_gaap1p0`); best f_cat 15.25%, outliers 10.02%, median dz −0.0006 |
+
+### DP2 SOM-matched era (`train_dp2.py`, 2026-08-11 →)
+
+Data: `415_clipped_train_rtn124_parquet_.../train_clipped_v3.parquet` (train,
+554,676 rows raw / 503,689 after `refExtendedness==1`) and
+`412_som_test_rtn124_parquet_.../test_som_mc_matched_v3.parquet` (test,
+18,400 rows raw / 17,278 after the same cut). No Euclid columns in either
+file. `--z-max` is a train/val-only cut — test always evaluates on the full,
+uncut redshift range (a bug where the initial z_max A/B trial also cut test
+was caught and fixed before these numbers).
+
+**z_max A/B test** (150 epochs, `--trial`, otherwise identical recipe,
+evaluated on the same full 17,278-galaxy test set both ways):
+
+| | `--z-max 0` (no train/val cut) | `--z-max 5.5` (train/val cut) |
+|---|---|---|
+| σ_NMAD | 0.0424 | 0.0411 |
+| Bias | 0.0711 | 0.0749 |
+| Outliers | 15.12% | 14.98% |
+| RMS | 0.3157 | 0.3170 |
+| f_cat | 17.55% | 17.72% |
+| z>5.5 slice (8 galaxies) | 100% outliers, z_pred max 4.43 | 100% outliers, δz −0.26 to −0.78 |
+
+Bulk metrics are a wash (unseeded weight init, differences are noise-level);
+the z>5.5 tail is a 100% catastrophic-outlier population for both models
+regardless of training exposure — not learnable from LSST+GAAP optical
+photometry alone. This motivated raising `_ZRED_MAX_SPEC` in Failure 13
+round 2 rather than just excluding the tail from training.
+
+**Full-recipe run attempts** (2000 epochs, batch 256, lr 1e-3,
+`--model-version new`, GAAP, LSST-only, synth warm-start from
+`mlpvae_synth_zsep_v1_no_euclid_gaap1p0/best.pt`, `--z-max 0`, all as
+`mlpvae_dp2_v1_lsst_gaap1p0`):
+
+| Attempt | Outcome | σ_NMAD (best avg) | Notes |
+|---|---|---|---|
+| 1 | crashed epoch 104/2000 | 0.0691 @ ep 101 (pre-crash ckpt: test σ_NMAD 0.0447) | Failure 13 round 1 (log_var_z clamp disabled) |
+| 2 | crashed epoch 458/2000 | 0.0629 @ ep 446 | Failure 13 round 2 (Jacobian collapse, `_ZRED_MAX_SPEC` too low) |
+| 3 (`mlpvae_dp2_v1_lsst_gaap1p0`) | **completed** 2000/2000, no NaN | 0.0555 @ ep 1905 | Failure 13 rounds 1+2 held for the full run (bounded spike ceiling through ~ep 950, then none); test σ_NMAD=0.0402, bias=0.0696, outliers=14.63%, RMS=0.3120, f_cat=17.56%. Post-hoc analysis found a second instability mechanism (unclamped `mu_15`, KL blowup ~ep 1400) and an epoch-schedule/DP1-batch-count mismatch — see Failure 13 round 3. |
+| 4 (`mlpvae_dp2_v2_lsst_gaap1p0`) | **completed** 600/600, no NaN, 3.9h (vs. dp2_v1's 14.5h) | 0.0560 | Failure 13 round 3: 600 epochs (was 2000), `_LATENT_CLAMP=15` on all raw latents, widened SPS physical ranges, quality-cut reporting added, `phase1_end.pt` retained for MLP-only-vs-MLP+VAE probing. Test σ_NMAD=0.0408, bias=0.0657, outliers=14.63%, RMS=0.3046, f_cat=17.54% — matches dp2_v1 at 3.7× less wall-clock. Quality-cut @70%: σ_NMAD=0.0264, bias=0.0040, outliers=3.02% |
+| 5 (`mlpvae_dp2_v3_lsst_gaap1p0`) | **completed** 600/600, no NaN, 3.2h | 0.0563 | Failure 13 round 4: warm-starts from `mlpvae_synth_zsep_v2_no_euclid_gaap1p0` (retrained against the new z<=6.5 Inoue speculator, best avg σ_NMAD=0.0201), same 600-epoch recipe otherwise. Test σ_NMAD=0.0410, bias=0.0704, outliers=14.93%, RMS=0.3176, f_cat=17.72%. Quality-cut @70%: σ_NMAD=0.0264 (identical to dp2_v2) — new speculator gave no measurable improvement (helps only the 8/17,278 z>5.5 test galaxies) |

@@ -362,7 +362,66 @@ def plot_scatter_density(z_true, z_pred, save_path,
     print(f"Saved scatter density → {save_path}")
     return bias, nmad, fout_3s, fout_02
 
+def plot_scatter_density_dp2(z_true, z_pred, save_path,
+                         zmin=0.0, zmax=3.0, n_bins=100):
+    """Grayscale 2D density scatter matching the reference paper style.
 
+    Draws four red dashed lines at ±3·σ_NMAD·(1+z) and ±0.2·(1+z),
+    matching the two outlier thresholds shown in the statistics box.
+
+    Parameters
+    ----------
+    z_true, z_pred : array-like  spectroscopic and photometric redshifts
+    save_path      : str         output file path
+    zmin, zmax     : float       axis / histogram range
+    n_bins         : int         histogram resolution per axis
+    """
+    from matplotlib.colors import LogNorm
+
+    mask   = np.isfinite(z_true) & np.isfinite(z_pred)
+    z_true = np.asarray(z_true)[mask]
+    z_pred = np.asarray(z_pred)[mask]
+    dz     = delta_z(z_pred, z_true)
+
+    med_dz  = np.median(dz)
+    bias    = float(np.mean(dz))
+    nmad    = float(1.4826 * np.median(np.abs(dz - med_dz)))
+    fout_015 = float(np.mean(np.abs(dz) > 0.15))
+
+    edges    = np.linspace(zmin, zmax, n_bins + 1)
+    H, xe, ye = np.histogram2d(z_true, z_pred, bins=[edges, edges])
+    H_masked  = np.where(H > 0, H, np.nan)
+
+    fig, ax = plt.subplots(figsize=(6, 5.2))
+    pcm  = ax.pcolormesh(xe, ye, H_masked.T,
+                         cmap="jet", norm=LogNorm(vmin=1), shading="auto")
+    cbar = fig.colorbar(pcm, ax=ax)
+    cbar.set_label("Density", fontsize=11)
+
+    zline = np.linspace(zmin, zmax, 300)
+    ax.plot(zline, zline, color="red", lw=1.5, zorder=5)
+    for sign in (-1, 1):
+        ax.plot(zline, zline + sign * 0.15 * (1.0 + zline),
+                "r--", lw=1.0, zorder=4)
+
+    ax.set_xlim(zmin, zmax)
+    ax.set_ylim(zmin, zmax)
+    ax.set_xlabel("True Redshift",      fontsize=12)
+    ax.set_ylabel("Estimated Redshift", fontsize=12)
+
+    info = (
+        f"bias<Δz> = {bias:.4f}\n"
+        f"σNMAD = {nmad:.4f}\n"
+        f"outlier |Δz|>0.15 = {fout_015*100:.1f}%"
+    )
+    ax.text(0.04, 0.96, info,
+            transform=ax.transAxes, va="top", ha="left", fontsize=9.5,
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="gray", alpha=0.85))
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved scatter density → {save_path}")
+    return bias, nmad, fout_015
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot 3c – two-panel binned metrics with global 3-sigma clipping
 # ─────────────────────────────────────────────────────────────────────────────

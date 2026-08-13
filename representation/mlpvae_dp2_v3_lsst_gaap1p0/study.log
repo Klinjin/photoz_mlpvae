@@ -1,0 +1,177 @@
+=== [best] extract train (cuts-then-split, 50k subsample) ===
+Read run config from /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/config.yaml
+Config: {'model_version': 'new', 'use_gaap': True, 'use_euclid': False, 'use_colors': True}
+Loaded /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/best.pt  (model_version=new, n_in=24)
+Loaded /astro/users/lindajin/obs_catalog/data/415_clipped_train_rtn124_parquet_0103491bd9870eb3d19bd89fa6cd57a9/train_clipped_v3.parquet: 554,676 rows -> 503,689 after cuts
+Split 'train' (val_frac=0.1, seed=42): 503,689 -> 453,321 rows
+Subsampled to 50,000 rows (seed=0)
+
+Extracting activations for 50,000 galaxies (batch=1024)...
+
+Saved 50,000 galaxies x 19 arrays -> /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probe_activations_train.npz
+  h0             (50000, 512)  dtype=float32
+  h1_mid         (50000, 512)  dtype=float32
+  h1             (50000, 512)  dtype=float32
+  h2_mid         (50000, 512)  dtype=float32
+  h2             (50000, 512)  dtype=float32
+  z_head_hidden  (50000, 128)  dtype=float32
+  mu_15          (50000, 15)  dtype=float32
+  log_var_15     (50000, 15)  dtype=float32
+  log_spec       (50000, 1999)  dtype=float32
+  m_ab_recon     (50000, 10)  dtype=float32
+  z_pred         (50000,)  dtype=float32
+  log_sigma_z    (50000,)  dtype=float32
+  theta_full     (50000, 16)  dtype=float32
+  x              (50000, 24)  dtype=float32
+  mask           (50000, 6)  dtype=float32
+  z_true         (50000,)  dtype=float32
+  i_ref          (50000,)  dtype=float64
+  g_minus_r      (50000,)  dtype=float64
+  dz             (50000,)  dtype=float32
+=== [best] extract test (full) ===
+Read run config from /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/config.yaml
+Config: {'model_version': 'new', 'use_gaap': True, 'use_euclid': False, 'use_colors': True}
+Loaded /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/best.pt  (model_version=new, n_in=24)
+Loaded /astro/users/lindajin/obs_catalog/data/412_som_test_rtn124_parquet_80763a5a141d268b7c6ed332ab552fbd/test_som_mc_matched_v3.parquet: 18,400 rows -> 17,278 after cuts
+
+Extracting activations for 17,278 galaxies (batch=1024)...
+
+Saved 17,278 galaxies x 19 arrays -> /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probe_activations_test.npz
+  h0             (17278, 512)  dtype=float32
+  h1_mid         (17278, 512)  dtype=float32
+  h1             (17278, 512)  dtype=float32
+  h2_mid         (17278, 512)  dtype=float32
+  h2             (17278, 512)  dtype=float32
+  z_head_hidden  (17278, 128)  dtype=float32
+  mu_15          (17278, 15)  dtype=float32
+  log_var_15     (17278, 15)  dtype=float32
+  log_spec       (17278, 1999)  dtype=float32
+  m_ab_recon     (17278, 10)  dtype=float32
+  z_pred         (17278,)  dtype=float32
+  log_sigma_z    (17278,)  dtype=float32
+  theta_full     (17278, 16)  dtype=float32
+  x              (17278, 24)  dtype=float32
+  mask           (17278, 6)  dtype=float32
+  z_true         (17278,)  dtype=float32
+  i_ref          (17278,)  dtype=float64
+  g_minus_r      (17278,)  dtype=float64
+  dz             (17278,)  dtype=float32
+=== [best] fit probes ===
+Train: /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probe_activations_train.npz (50,000)
+Test:  /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probe_activations_test.npz (17,278)
+
+Fitting 19 targets x 11 layers (209 probes)...
+  z (redshift)           x=0.263, h0=0.355, h1_mid=0.498, h1=0.500, h2_mid=0.536, h2=0.557, z_head_hidden=0.561, z_out=0.496, mu_15=0.535, log_spec=0.560, m_ab_recon=0.354
+    (z sigma_NMAD)       x=0.2018, h0=0.1744, h1_mid=0.1032, h1=0.1043, h2_mid=0.0871, h2=0.0771, z_head_hidden=0.0664, z_out=0.1137, mu_15=0.0847, log_spec=0.0624, m_ab_recon=0.1827
+  log σ_z (model uncertainty) x=0.415, h0=0.468, h1_mid=0.631, h1=0.684, h2_mid=0.760, h2=0.901, z_head_hidden=0.998, z_out=1.000, mu_15=0.825, log_spec=0.917, m_ab_recon=0.471
+  i magnitude            x=1.000, h0=0.999, h1_mid=0.992, h1=0.986, h2_mid=0.949, h2=0.947, z_head_hidden=0.665, z_out=0.351, mu_15=0.895, log_spec=0.747, m_ab_recon=0.933
+  g−r color              x=0.992, h0=0.998, h1_mid=0.973, h1=0.965, h2_mid=0.889, h2=0.942, z_head_hidden=0.646, z_out=-0.028, mu_15=0.693, log_spec=0.718, m_ab_recon=0.615
+  logmass                x=0.304, h0=0.477, h1_mid=0.757, h1=0.800, h2_mid=0.851, h2=0.925, z_head_hidden=0.690, z_out=0.177, mu_15=0.997, log_spec=0.782, m_ab_recon=0.579
+  logzsol                x=0.449, h0=0.755, h1_mid=0.866, h1=0.892, h2_mid=0.882, h2=0.994, z_head_hidden=0.517, z_out=-0.006, mu_15=0.999, log_spec=0.995, m_ab_recon=0.677
+  dust2                  x=0.292, h0=0.490, h1_mid=0.755, h1=0.777, h2_mid=0.810, h2=0.941, z_head_hidden=0.679, z_out=-0.083, mu_15=0.993, log_spec=0.998, m_ab_recon=0.636
+  dust1_fraction         x=0.335, h0=0.458, h1_mid=0.647, h1=0.636, h2_mid=0.780, h2=0.898, z_head_hidden=0.752, z_out=0.477, mu_15=1.000, log_spec=0.819, m_ab_recon=0.534
+  dust_index             x=0.581, h0=0.774, h1_mid=0.888, h1=0.911, h2_mid=0.881, h2=0.963, z_head_hidden=0.562, z_out=0.056, mu_15=0.950, log_spec=0.999, m_ab_recon=0.807
+  gas_logz               x=0.158, h0=0.422, h1_mid=0.575, h1=0.579, h2_mid=0.611, h2=0.760, z_head_hidden=0.782, z_out=0.594, mu_15=1.000, log_spec=0.916, m_ab_recon=0.408
+  fagn                   x=0.325, h0=0.357, h1_mid=0.611, h1=0.628, h2_mid=0.675, h2=0.803, z_head_hidden=0.755, z_out=0.478, mu_15=0.969, log_spec=0.884, m_ab_recon=0.520
+  agn_tau                x=-0.145, h0=0.146, h1_mid=0.528, h1=0.639, h2_mid=0.674, h2=0.941, z_head_hidden=0.589, z_out=0.294, mu_15=1.000, log_spec=0.775, m_ab_recon=0.065
+  igm_scale              x=0.106, h0=0.209, h1_mid=0.400, h1=0.387, h2_mid=0.533, h2=0.563, z_head_hidden=0.802, z_out=0.600, mu_15=0.990, log_spec=0.904, m_ab_recon=0.497
+  logsfr_ratios_0        x=0.489, h0=0.591, h1_mid=0.802, h1=0.860, h2_mid=0.823, h2=0.995, z_head_hidden=0.768, z_out=0.256, mu_15=0.996, log_spec=0.995, m_ab_recon=0.627
+  logsfr_ratios_1        x=0.384, h0=0.660, h1_mid=0.806, h1=0.877, h2_mid=0.910, h2=0.973, z_head_hidden=0.942, z_out=0.629, mu_15=0.989, log_spec=0.999, m_ab_recon=0.695
+  logsfr_ratios_2        x=0.424, h0=0.604, h1_mid=0.833, h1=0.879, h2_mid=0.859, h2=0.969, z_head_hidden=0.919, z_out=0.164, mu_15=0.980, log_spec=0.997, m_ab_recon=0.623
+  logsfr_ratios_3        x=0.226, h0=0.377, h1_mid=0.625, h1=0.682, h2_mid=0.826, h2=0.963, z_head_hidden=0.623, z_out=0.186, mu_15=0.997, log_spec=0.969, m_ab_recon=0.472
+  logsfr_ratios_4        x=0.242, h0=0.341, h1_mid=0.719, h1=0.775, h2_mid=0.803, h2=0.958, z_head_hidden=0.830, z_out=0.509, mu_15=0.994, log_spec=0.993, m_ab_recon=0.333
+  logsfr_ratios_5        x=0.463, h0=0.544, h1_mid=0.789, h1=0.771, h2_mid=0.817, h2=0.979, z_head_hidden=0.659, z_out=-0.008, mu_15=0.998, log_spec=0.966, m_ab_recon=0.510
+
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probes/probe_r2.csv
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probes/probe_r2_redshift.png
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probes/probe_r2_photometry.png
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/best/probes/probe_r2_sps_params.png
+=== [phase1_end] extract train (cuts-then-split, 50k subsample) ===
+Read run config from /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/config.yaml
+Config: {'model_version': 'new', 'use_gaap': True, 'use_euclid': False, 'use_colors': True}
+Loaded /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end.pt  (model_version=new, n_in=24)
+Loaded /astro/users/lindajin/obs_catalog/data/415_clipped_train_rtn124_parquet_0103491bd9870eb3d19bd89fa6cd57a9/train_clipped_v3.parquet: 554,676 rows -> 503,689 after cuts
+Split 'train' (val_frac=0.1, seed=42): 503,689 -> 453,321 rows
+Subsampled to 50,000 rows (seed=0)
+
+Extracting activations for 50,000 galaxies (batch=1024)...
+
+Saved 50,000 galaxies x 19 arrays -> /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probe_activations_train.npz
+  h0             (50000, 512)  dtype=float32
+  h1_mid         (50000, 512)  dtype=float32
+  h1             (50000, 512)  dtype=float32
+  h2_mid         (50000, 512)  dtype=float32
+  h2             (50000, 512)  dtype=float32
+  z_head_hidden  (50000, 128)  dtype=float32
+  mu_15          (50000, 15)  dtype=float32
+  log_var_15     (50000, 15)  dtype=float32
+  log_spec       (50000, 1999)  dtype=float32
+  m_ab_recon     (50000, 10)  dtype=float32
+  z_pred         (50000,)  dtype=float32
+  log_sigma_z    (50000,)  dtype=float32
+  theta_full     (50000, 16)  dtype=float32
+  x              (50000, 24)  dtype=float32
+  mask           (50000, 6)  dtype=float32
+  z_true         (50000,)  dtype=float32
+  i_ref          (50000,)  dtype=float64
+  g_minus_r      (50000,)  dtype=float64
+  dz             (50000,)  dtype=float32
+=== [phase1_end] extract test (full) ===
+Read run config from /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/config.yaml
+Config: {'model_version': 'new', 'use_gaap': True, 'use_euclid': False, 'use_colors': True}
+Loaded /astro/users/lindajin/photoz_mlpvae/trained/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end.pt  (model_version=new, n_in=24)
+Loaded /astro/users/lindajin/obs_catalog/data/412_som_test_rtn124_parquet_80763a5a141d268b7c6ed332ab552fbd/test_som_mc_matched_v3.parquet: 18,400 rows -> 17,278 after cuts
+
+Extracting activations for 17,278 galaxies (batch=1024)...
+
+Saved 17,278 galaxies x 19 arrays -> /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probe_activations_test.npz
+  h0             (17278, 512)  dtype=float32
+  h1_mid         (17278, 512)  dtype=float32
+  h1             (17278, 512)  dtype=float32
+  h2_mid         (17278, 512)  dtype=float32
+  h2             (17278, 512)  dtype=float32
+  z_head_hidden  (17278, 128)  dtype=float32
+  mu_15          (17278, 15)  dtype=float32
+  log_var_15     (17278, 15)  dtype=float32
+  log_spec       (17278, 1999)  dtype=float32
+  m_ab_recon     (17278, 10)  dtype=float32
+  z_pred         (17278,)  dtype=float32
+  log_sigma_z    (17278,)  dtype=float32
+  theta_full     (17278, 16)  dtype=float32
+  x              (17278, 24)  dtype=float32
+  mask           (17278, 6)  dtype=float32
+  z_true         (17278,)  dtype=float32
+  i_ref          (17278,)  dtype=float64
+  g_minus_r      (17278,)  dtype=float64
+  dz             (17278,)  dtype=float32
+=== [phase1_end] fit probes ===
+Train: /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probe_activations_train.npz (50,000)
+Test:  /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probe_activations_test.npz (17,278)
+
+Fitting 19 targets x 11 layers (209 probes)...
+  z (redshift)           x=0.263, h0=0.371, h1_mid=0.498, h1=0.519, h2_mid=0.539, h2=0.551, z_head_hidden=0.549, z_out=0.481, mu_15=0.511, log_spec=0.543, m_ab_recon=0.368
+    (z sigma_NMAD)       x=0.2018, h0=0.1718, h1_mid=0.1053, h1=0.0947, h2_mid=0.0772, h2=0.0740, z_head_hidden=0.0791, z_out=0.1177, mu_15=0.0772, log_spec=0.0612, m_ab_recon=0.1731
+  log σ_z (model uncertainty) x=0.414, h0=0.487, h1_mid=0.729, h1=0.809, h2_mid=0.896, h2=0.951, z_head_hidden=0.998, z_out=1.000, mu_15=0.713, log_spec=0.832, m_ab_recon=0.530
+  i magnitude            x=1.000, h0=0.996, h1_mid=0.996, h1=0.987, h2_mid=0.977, h2=0.974, z_head_hidden=0.661, z_out=0.368, mu_15=0.766, log_spec=0.836, m_ab_recon=0.456
+  g−r color              x=0.992, h0=0.990, h1_mid=0.992, h1=0.977, h2_mid=0.926, h2=0.974, z_head_hidden=0.468, z_out=-0.015, mu_15=0.607, log_spec=0.605, m_ab_recon=0.287
+  logmass                x=0.290, h0=0.554, h1_mid=0.802, h1=0.829, h2_mid=0.915, h2=0.957, z_head_hidden=0.948, z_out=0.936, mu_15=0.999, log_spec=0.975, m_ab_recon=0.657
+  logzsol                x=0.521, h0=0.722, h1_mid=0.830, h1=0.878, h2_mid=0.920, h2=0.968, z_head_hidden=0.710, z_out=0.162, mu_15=0.999, log_spec=0.997, m_ab_recon=0.628
+  dust2                  x=0.351, h0=0.586, h1_mid=0.807, h1=0.845, h2_mid=0.922, h2=0.964, z_head_hidden=0.951, z_out=0.931, mu_15=0.999, log_spec=1.000, m_ab_recon=0.713
+  dust1_fraction         x=0.357, h0=0.606, h1_mid=0.836, h1=0.885, h2_mid=0.937, h2=0.983, z_head_hidden=0.731, z_out=0.609, mu_15=1.000, log_spec=0.993, m_ab_recon=0.580
+  dust_index             x=0.444, h0=0.606, h1_mid=0.842, h1=0.880, h2_mid=0.934, h2=0.977, z_head_hidden=0.951, z_out=0.906, mu_15=0.994, log_spec=1.000, m_ab_recon=0.814
+  gas_logz               x=0.199, h0=0.584, h1_mid=0.824, h1=0.854, h2_mid=0.920, h2=0.969, z_head_hidden=0.869, z_out=0.755, mu_15=0.999, log_spec=0.994, m_ab_recon=0.488
+  fagn                   x=0.556, h0=0.658, h1_mid=0.859, h1=0.914, h2_mid=0.940, h2=0.991, z_head_hidden=0.709, z_out=0.341, mu_15=0.995, log_spec=0.977, m_ab_recon=0.621
+  agn_tau                x=0.183, h0=0.562, h1_mid=0.839, h1=0.867, h2_mid=0.924, h2=0.979, z_head_hidden=0.792, z_out=0.624, mu_15=0.956, log_spec=0.917, m_ab_recon=0.401
+  igm_scale              x=0.236, h0=0.544, h1_mid=0.796, h1=0.848, h2_mid=0.929, h2=0.972, z_head_hidden=0.871, z_out=0.772, mu_15=1.000, log_spec=0.943, m_ab_recon=0.591
+  logsfr_ratios_0        x=0.364, h0=0.589, h1_mid=0.806, h1=0.842, h2_mid=0.908, h2=0.966, z_head_hidden=0.775, z_out=0.707, mu_15=1.000, log_spec=1.000, m_ab_recon=0.626
+  logsfr_ratios_1        x=0.484, h0=0.645, h1_mid=0.841, h1=0.872, h2_mid=0.931, h2=0.973, z_head_hidden=0.969, z_out=0.945, mu_15=0.984, log_spec=0.998, m_ab_recon=0.802
+  logsfr_ratios_2        x=0.472, h0=0.626, h1_mid=0.815, h1=0.833, h2_mid=0.911, h2=0.962, z_head_hidden=0.940, z_out=0.917, mu_15=0.995, log_spec=0.987, m_ab_recon=0.744
+  logsfr_ratios_3        x=0.290, h0=0.484, h1_mid=0.750, h1=0.790, h2_mid=0.881, h2=0.945, z_head_hidden=0.941, z_out=0.921, mu_15=0.994, log_spec=0.991, m_ab_recon=0.685
+  logsfr_ratios_4        x=0.334, h0=0.548, h1_mid=0.810, h1=0.859, h2_mid=0.932, h2=0.979, z_head_hidden=0.889, z_out=0.874, mu_15=1.000, log_spec=0.984, m_ab_recon=0.688
+  logsfr_ratios_5        x=0.320, h0=0.540, h1_mid=0.771, h1=0.798, h2_mid=0.892, h2=0.949, z_head_hidden=0.923, z_out=0.927, mu_15=1.000, log_spec=0.984, m_ab_recon=0.757
+
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probes/probe_r2.csv
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probes/probe_r2_redshift.png
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probes/probe_r2_photometry.png
+Saved /astro/users/lindajin/photoz_mlpvae/representation/mlpvae_dp2_v3_lsst_gaap1p0/phase1_end/probes/probe_r2_sps_params.png
+ALL DONE
