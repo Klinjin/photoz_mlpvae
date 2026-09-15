@@ -28,15 +28,18 @@ Public API
       val_df is an empty DataFrame if val_frac=0.
 
   build_features(df, use_colors=True, use_euclid=True, scaler=None,
-                 col_medians=None, fit=False)
+                 col_medians=None, fit=False, standardize=True)
       Returns (X, mags_obs, mag_errs, mask, z_spec, scaler, col_medians).
         X           (N, D) float32   encoder input; D=40 with Euclid, 24 without
         mags_obs    (N, B) float32   raw AB mags  (imputed, for reconstruction)
         mag_errs    (N, B) float32   raw mag errs (imputed, clipped ≥ 0.005)
         mask        (N, B) float32   band-presence mask; B=10 with Euclid, 6 without
         z_spec      (N,)   float32   spectroscopic redshift
-        scaler      fitted StandardScaler
+        scaler      fitted StandardScaler, or None if standardize=False
         col_medians imputation medians
+      standardize=False skips StandardScaler entirely and feeds raw
+      colours/mags(+errs) straight into the encoder input (still with the
+      usual -50.0 missingness sentinel).
 
   compute_z_weights(z_spec, n_bins=25, z_max=5.5)
       Inverse-frequency per-galaxy weights (mean = 1).
@@ -273,10 +276,235 @@ def load_catalog(path=None, seed=42, val_frac=0.10, test_frac=0.20):
 # Feature engineering helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _raw_mags_errs_mask(df, mag_cols, err_cols):
+
+def _build_mag_features(df, mag_cols, err_cols, scaler=None, col_medians=None, fit=False,
+                        standardize=True, double_precision=False):
+    """
+    Magnitude-based encoder input:
+      [B scaled mags | B scaled errs | B mag-miss flags | B err-miss flags]
+    B=10 (with Euclid) → 40-dim; B=6 (LSST only) → 24-dim.
+
+    standardize : True (default) → z-score via StandardScaler (fitted when
+                  fit=True, else the passed-in `scaler` is applied); False →
+                  pass raw mags/errs through unscaled and `scaler` stays
+                  whatever was passed in (None if never fit standardized).
+    double_precision : False (default) → X is float32, matching every
+                  existing checkpoint's float32 weights (a float64 X raises
+                  "mat1 and mat2 must have the same dtype" against them).
+                  True → X is float64; only for callers that explicitly
+                  need double precision and will train/load a matching
+                  float64 model.
+
+    Returns (X, scaler, col_medians).
+    """
+    dtype = np.float64 if double_precision else np.float32
+
+    mags = df[mag_cols].copy().replace([np.inf, -np.inf], np.nan)
+    errs = df[err_cols].copy().replace([np.inf, -np.inf], np.nan).clip(lower=0)
+
+    m_ok = (mags.notna()).values #& (mags > 0) & (mags < 35)
+    e_ok = (errs.notna()).values # & (errs > 0)
+    missing_mags = (~m_ok).astype(dtype)
+    missing_errs = (~e_ok).astype(dtype)
+
+    feat_df = pd.concat([mags, errs], axis=1)   # (N, 20)
+
+    if fit:
+        # col_medians kept only for save/load API compatibility with older
+        # checkpoints; sklearn ignores NaNs natively when fitting/transforming.
+        # Computed regardless of `standardize` so downstream checkpoint
+        # save/load always has a usable value.
+        col_medians = feat_df.median(axis=0).values
+        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
+        if standardize:
+            scaler = StandardScaler()
+            scaler.fit(feat_df)
+
+    # transform() passes NaNs straight through; the sentinel overwrite below
+    # replaces those cells, so no imputation is needed here.
+    if standardize:
+        feat_sc = scaler.transform(feat_df).astype(dtype)
+    else:
+        feat_sc = feat_df.values.astype(dtype)
+    # Overwrite missing slots with an out-of-range sentinel so the encoder
+    # sees a clean OOD signal instead of a real value for missing bands.
+    # StandardScaler maps real observations to ~[-3, 3]; raw mags/errs are
+    # always positive; -50.0 is unambiguous either way.
+    missing_mask = np.concatenate([~m_ok, ~e_ok], axis=1)  # (N, 20)
+    feat_sc[missing_mask] = -50.0
+    X = np.concatenate([feat_sc, missing_mags, missing_errs], axis=1).astype(dtype)  # (N, 40)
+    return X, scaler, col_medians
+
+
+def _build_color_features(df, color_pairs, scaler=None, col_medians=None, fit=False,
+                          ref_mag=None, ref_err=None, standardize=True,
+                          double_precision=False):
+    """
+    Colour-based encoder input:
+      [C colours | C colour-errs | i_ref | i_ref_err | 2*(C+1) missingness flags]
+    C=9 (with Euclid) → 40-dim; C=5 (LSST only) → 24-dim.
+
+    standardize : True (default) → z-score via StandardScaler (fitted when
+                  fit=True, else the passed-in `scaler` is applied); False →
+                  pass raw colours/mags through unscaled and `scaler` stays
+                  whatever was passed in (None if never fit standardized).
+    double_precision : False (default) → X is float32, matching every
+                  existing checkpoint's float32 weights (a float64 X raises
+                  "mat1 and mat2 must have the same dtype" against them).
+                  True → X is float64; only for callers that explicitly
+                  need double precision and will train/load a matching
+                  float64 model.
+
+    Returns (X, scaler, col_medians).
+    """
+    dtype = np.float64 if double_precision else np.float32
+
+    if ref_mag is None:
+        ref_mag = REF_MAG
+    if ref_err is None:
+        ref_err = REF_ERR
+
+    colour_cols, cerr_cols = [], []
+    for m1, e1, m2, e2, cname in color_pairs:
+        v1 = df[m1].replace([np.inf, -np.inf], np.nan)
+        v2 = df[m2].replace([np.inf, -np.inf], np.nan)
+        s1 = df[e1].replace([np.inf, -np.inf], np.nan)
+        s2 = df[e2].replace([np.inf, -np.inf], np.nan)
+        colour_cols.append((v1 - v2).rename(cname))
+        cerr_cols.append(np.sqrt(s1 ** 2 + s2 ** 2).rename(cname + "_err"))
+
+    ref   = df[ref_mag].replace([np.inf, -np.inf], np.nan).rename("i_ref")
+    r_err = df[ref_err].replace([np.inf, -np.inf], np.nan).rename("i_ref_err")
+
+    feat_df = pd.concat(colour_cols + cerr_cols + [ref, r_err], axis=1)  # (N, 20)
+    missing = feat_df.isna().values.astype(dtype)                        # (N, 20)
+
+    if fit:
+        # col_medians kept only for save/load API compatibility with older
+        # checkpoints; sklearn ignores NaNs natively when fitting/transforming.
+        # Computed regardless of `standardize` so downstream checkpoint
+        # save/load always has a usable value.
+        col_medians = feat_df.median(axis=0).values
+        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
+        if standardize:
+            scaler = StandardScaler()
+            scaler.fit(feat_df)
+
+    # transform() passes NaNs straight through; the sentinel overwrite below
+    # replaces those cells, so no imputation is needed here.
+    if standardize:
+        feat_sc = scaler.transform(feat_df).astype(dtype)
+    else:
+        feat_sc = feat_df.values.astype(dtype)
+    # Overwrite missing slots with an out-of-range sentinel so the encoder
+    # sees a clean OOD signal instead of a real value for missing bands.
+    # StandardScaler maps real observations to ~[-3, 3]; raw colours/mags
+    # never reach anywhere near -50 either, so it's unambiguous either way.
+    feat_sc[feat_df.isna().values] = -50.0
+    X = np.concatenate([feat_sc, missing], axis=1).astype(dtype)  # (N, 40)
+    return X, scaler, col_medians
+
+
+def build_features(df, use_colors=True, use_euclid=True, use_gaap=False, use_psf=False,
+                   scaler=None, col_medians=None, fit=False, target_col=TARGET_COL,
+                   standardize=True, double_precision=False):
+    """
+    Build all tensors needed for one catalog split.
+
+    Parameters
+    ----------
+    df          : pd.DataFrame from load_catalog
+    use_colors  : True → colour features; False → magnitude features
+    use_euclid  : True → include Euclid bands (10 bands, D=40);
+                  False → LSST only (6 bands, D=24)
+    use_gaap    : True → use GAAP 1.0-arcsec aperture mags for LSST bands
+                  instead of cModel mags (Euclid columns are unchanged)
+    use_psf     : True → use PSF mags for LSST bands instead of cModel mags
+                  (Euclid columns are unchanged; ignored if use_gaap=True)
+    scaler      : pre-fitted StandardScaler (required when fit=False and
+                  standardize=True; unused/should be None when standardize=False)
+    col_medians : pre-computed imputation medians (required when fit=False)
+    fit         : if True, fit scaler + col_medians from df (train split only)
+    standardize : True (default) → z-score colours/mags+errs via StandardScaler;
+                  False → pass the raw colours/mags (or raw mags/errs in
+                  magnitude mode) through unscaled. `scaler` comes back None
+                  in that case since none was fit.
+    double_precision : False (default) → all five array outputs (X,
+                  mags_obs, mag_errs, mask, z_spec) are float32, matching
+                  every existing checkpoint's float32 weights. True → all
+                  five are float64; only use this if you are training/
+                  loading a model itself built in double precision (e.g.
+                  PhotozMLPVAE(..., double_precision=True)) -- mixing
+                  dtypes anywhere in model.loss()'s inputs (X vs.
+                  mags_obs/mag_errs/mask/z_spec, or either vs. the model's
+                  own weights) raises "mat1 and mat2 must have the same
+                  dtype" or an elementwise dtype-mismatch error.
+
+    Returns
+    -------
+    X           : (N, D) float32 (float64 if double_precision=True)
+                  encoder input; D=40 with Euclid, 24 without
+    mags_obs    : (N, B) float32 (float64)  raw AB mags  (imputed; for reconstruction loss)
+    mag_errs    : (N, B) float32 (float64)  raw mag errs (imputed; clipped ≥ 0.005)
+    mask        : (N, B) float32 (float64)  band-presence mask; 10 with Euclid, 6 without
+    z_spec      : (N,)   float32 (float64)  spectroscopic redshift
+    scaler      : fitted/passed StandardScaler
+    col_medians : imputation medians
+    """
+    if use_gaap:
+        mag_cols    = GAAP_MAG_COLS    if use_euclid else LSST_GAAP_MAG_COLS
+        err_cols    = GAAP_ERR_COLS    if use_euclid else LSST_GAAP_ERR_COLS
+        color_pairs = GAAP_COLOR_PAIRS if use_euclid else GAAP_COLOR_PAIRS[:5]
+        ref_mag, ref_err = GAAP_REF_MAG, GAAP_REF_ERR
+    elif use_psf:
+        mag_cols    = PSF_MAG_COLS    if use_euclid else LSST_PSF_MAG_COLS
+        err_cols    = PSF_ERR_COLS    if use_euclid else LSST_PSF_ERR_COLS
+        color_pairs = PSF_COLOR_PAIRS if use_euclid else PSF_COLOR_PAIRS[:5]
+        ref_mag, ref_err = PSF_REF_MAG, PSF_REF_ERR
+    else:
+        mag_cols    = MAG_COLS    if use_euclid else LSST_MAG_COLS
+        err_cols    = ERR_COLS    if use_euclid else LSST_ERR_COLS
+        color_pairs = COLOR_PAIRS if use_euclid else COLOR_PAIRS[:5]
+        ref_mag, ref_err = REF_MAG, REF_ERR
+
+    if use_colors:
+        X, scaler, col_medians = _build_color_features(
+            df, color_pairs, scaler=scaler, col_medians=col_medians, fit=fit,
+            ref_mag=ref_mag, ref_err=ref_err, standardize=standardize,
+            double_precision=double_precision)
+    else:
+        X, scaler, col_medians = _build_mag_features(
+            df, mag_cols, err_cols, scaler=scaler, col_medians=col_medians, fit=fit,
+            standardize=standardize, double_precision=double_precision)
+        
+    z_spec = df[target_col].values.astype(np.float64 if double_precision else np.float32)
+
+    return X, z_spec, scaler, col_medians
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Raw per-band mags/errs/mask (diagnostics only -- NOT part of build_features)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# build_features()/make_dataloader() no longer return/carry mags_obs/
+# mag_errs/mask (2026-08-24) -- models' loss() now derives its reconstruction
+# target straight out of X (see photoz_mlpvae's reconstruction_target_from_x).
+# This standalone helper (the old _raw_mags_errs_mask, made public) exists
+# only for callers that still want raw per-band photometry for a handful of
+# galaxies -- e.g. SED-reconstruction diagnostic plots -- and should be
+# called directly on a df subset, not wired back into the training loader.
+
+def raw_mags_errs_mask(df, mag_cols, err_cols):
     """
     Extract raw (median-imputed) mags, errors, and band-presence mask.
-    Used as reconstruction targets for models with a photometric decoder.
+    For diagnostics (e.g. plot_sed_reconstructions) -- not used by
+    build_features/make_dataloader or any model's loss().
+
+    Parameters
+    ----------
+    df       : pd.DataFrame (or a row subset of one)
+    mag_cols : list of magnitude column names, e.g. MAG_COLS/GAAP_MAG_COLS
+    err_cols : matching list of magnitude-error column names
 
     Returns
     -------
@@ -308,159 +536,16 @@ def _raw_mags_errs_mask(df, mag_cols, err_cols):
     return mags_imp.astype(np.float32), errs_imp.astype(np.float32), mask
 
 
-def _build_mag_features(df, mag_cols, err_cols, scaler=None, col_medians=None, fit=False):
-    """
-    Magnitude-based encoder input:
-      [B scaled mags | B scaled errs | B mag-miss flags | B err-miss flags]
-    B=10 (with Euclid) → 40-dim; B=6 (LSST only) → 24-dim.
-
-    Returns (X, scaler, col_medians).
-    """
-    mags = df[mag_cols].copy().replace([np.inf, -np.inf], np.nan)
-    errs = df[err_cols].copy().replace([np.inf, -np.inf], np.nan).clip(lower=0)
-
-    m_ok = (mags.notna()).values #& (mags > 0) & (mags < 35)
-    e_ok = (errs.notna()).values # & (errs > 0)
-    missing_mags = (~m_ok).astype(np.float32)
-    missing_errs = (~e_ok).astype(np.float32)
-
-    feat_df = pd.concat([mags, errs], axis=1)   # (N, 20)
-
-    if fit:
-        col_medians = feat_df.median(axis=0).values
-        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
-        scaler      = StandardScaler()
-        feat_imp    = feat_df.fillna(pd.Series(col_medians, index=feat_df.columns)).fillna(0.0)
-        scaler.fit(feat_imp)
-    else:
-        feat_imp = feat_df.fillna(pd.Series(col_medians, index=feat_df.columns)).fillna(0.0)
-
-    feat_sc = scaler.transform(feat_imp).astype(np.float32)
-    # Overwrite imputed-missing slots with an out-of-range sentinel so the
-    # encoder sees a clean OOD signal instead of median≈0 for missing bands.
-    # StandardScaler maps real observations to ~[-3, 3]; -50.0 is unambiguous.
-    missing_mask = np.concatenate([~m_ok, ~e_ok], axis=1)  # (N, 20)
-    feat_sc[missing_mask] = -50.0
-    X = np.concatenate([feat_sc, missing_mags, missing_errs], axis=1)  # (N, 40)
-    return X, scaler, col_medians
-
-
-def _build_color_features(df, color_pairs, scaler=None, col_medians=None, fit=False,
-                          ref_mag=None, ref_err=None):
-    """
-    Colour-based encoder input:
-      [C colours | C colour-errs | i_ref | i_ref_err | 2*(C+1) missingness flags]
-    C=9 (with Euclid) → 40-dim; C=5 (LSST only) → 24-dim.
-
-    Returns (X, scaler, col_medians).
-    """
-    if ref_mag is None:
-        ref_mag = REF_MAG
-    if ref_err is None:
-        ref_err = REF_ERR
-
-    colour_cols, cerr_cols = [], []
-    for m1, e1, m2, e2, cname in color_pairs:
-        v1 = df[m1].replace([np.inf, -np.inf], np.nan)
-        v2 = df[m2].replace([np.inf, -np.inf], np.nan)
-        s1 = df[e1].replace([np.inf, -np.inf], np.nan).clip(lower=0)
-        s2 = df[e2].replace([np.inf, -np.inf], np.nan).clip(lower=0)
-        colour_cols.append((v1 - v2).rename(cname))
-        cerr_cols.append(np.sqrt(s1 ** 2 + s2 ** 2).rename(cname + "_err"))
-
-    ref   = df[ref_mag].replace([np.inf, -np.inf], np.nan).rename("i_ref")
-    r_err = df[ref_err].replace([np.inf, -np.inf], np.nan).rename("i_ref_err")
-
-    feat_df = pd.concat(colour_cols + cerr_cols + [ref, r_err], axis=1)  # (N, 20)
-    missing = feat_df.isna().values.astype(np.float32)                   # (N, 20)
-
-    if fit:
-        col_medians = feat_df.median(axis=0).values
-        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
-        scaler      = StandardScaler()
-        feat_imp    = feat_df.fillna(pd.Series(col_medians, index=feat_df.columns)).fillna(0.0)
-        scaler.fit(feat_imp)
-    else:
-        feat_imp = feat_df.fillna(pd.Series(col_medians, index=feat_df.columns)).fillna(0.0)
-
-    feat_sc = scaler.transform(feat_imp).astype(np.float32)
-    # Overwrite imputed-missing slots with an out-of-range sentinel so the
-    # encoder sees a clean OOD signal instead of median≈0 for missing bands.
-    # StandardScaler maps real observations to ~[-3, 3]; -50.0 is unambiguous.
-    feat_sc[feat_df.isna().values] = -50.0
-    X = np.concatenate([feat_sc, missing], axis=1)  # (N, 40)
-    return X, scaler, col_medians
-
-
-def build_features(df, use_colors=True, use_euclid=True, use_gaap=False, use_psf=False,
-                   scaler=None, col_medians=None, fit=False, target_col=TARGET_COL):
-    """
-    Build all tensors needed for one catalog split.
-
-    Parameters
-    ----------
-    df          : pd.DataFrame from load_catalog
-    use_colors  : True → colour features; False → magnitude features
-    use_euclid  : True → include Euclid bands (10 bands, D=40);
-                  False → LSST only (6 bands, D=24)
-    use_gaap    : True → use GAAP 1.0-arcsec aperture mags for LSST bands
-                  instead of cModel mags (Euclid columns are unchanged)
-    use_psf     : True → use PSF mags for LSST bands instead of cModel mags
-                  (Euclid columns are unchanged; ignored if use_gaap=True)
-    scaler      : pre-fitted StandardScaler (required when fit=False)
-    col_medians : pre-computed imputation medians (required when fit=False)
-    fit         : if True, fit scaler + col_medians from df (train split only)
-
-    Returns
-    -------
-    X           : (N, D) float32  encoder input; D=40 with Euclid, 24 without
-    mags_obs    : (N, B) float32  raw AB mags  (imputed; for reconstruction loss)
-    mag_errs    : (N, B) float32  raw mag errs (imputed; clipped ≥ 0.005)
-    mask        : (N, B) float32  band-presence mask; B=10 with Euclid, 6 without
-    z_spec      : (N,)   float32  spectroscopic redshift
-    scaler      : fitted/passed StandardScaler
-    col_medians : imputation medians
-    """
-    if use_gaap:
-        mag_cols    = GAAP_MAG_COLS    if use_euclid else LSST_GAAP_MAG_COLS
-        err_cols    = GAAP_ERR_COLS    if use_euclid else LSST_GAAP_ERR_COLS
-        color_pairs = GAAP_COLOR_PAIRS if use_euclid else GAAP_COLOR_PAIRS[:5]
-        ref_mag, ref_err = GAAP_REF_MAG, GAAP_REF_ERR
-    elif use_psf:
-        mag_cols    = PSF_MAG_COLS    if use_euclid else LSST_PSF_MAG_COLS
-        err_cols    = PSF_ERR_COLS    if use_euclid else LSST_PSF_ERR_COLS
-        color_pairs = PSF_COLOR_PAIRS if use_euclid else PSF_COLOR_PAIRS[:5]
-        ref_mag, ref_err = PSF_REF_MAG, PSF_REF_ERR
-    else:
-        mag_cols    = MAG_COLS    if use_euclid else LSST_MAG_COLS
-        err_cols    = ERR_COLS    if use_euclid else LSST_ERR_COLS
-        color_pairs = COLOR_PAIRS if use_euclid else COLOR_PAIRS[:5]
-        ref_mag, ref_err = REF_MAG, REF_ERR
-
-    if use_colors:
-        X, scaler, col_medians = _build_color_features(
-            df, color_pairs, scaler=scaler, col_medians=col_medians, fit=fit,
-            ref_mag=ref_mag, ref_err=ref_err)
-    else:
-        X, scaler, col_medians = _build_mag_features(
-            df, mag_cols, err_cols, scaler=scaler, col_medians=col_medians, fit=fit)
-
-    mags_obs, mag_errs, mask = _raw_mags_errs_mask(df, mag_cols, err_cols)
-    z_spec = df[target_col].values.astype(np.float32)
-
-    return X, mags_obs, mag_errs, mask, z_spec, scaler, col_medians
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Inverse-frequency redshift weights
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_z_weights(z_spec, n_bins=25, z_max=5.5):
+def compute_z_weights(z_spec, n_bins=10):
     """
     Per-galaxy inverse-frequency weights so that high-z galaxies contribute
     equally to the loss (in expectation). Weights are normalised to mean = 1.
     """
-    counts, edges = np.histogram(z_spec, bins=n_bins, range=(0.0, z_max))
+    counts, edges = np.histogram(z_spec, bins=n_bins, range=(0.0, z_spec.max()))
     counts  = np.maximum(counts, 1)
     bin_idx = np.clip(np.digitize(z_spec, edges) - 1, 0, n_bins - 1)
     w = len(z_spec) / (n_bins * counts[bin_idx])
@@ -471,16 +556,16 @@ def compute_z_weights(z_spec, n_bins=25, z_max=5.5):
 # DataLoader factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_dataloader(X, mags, errs, mask, z, weights,
+def make_dataloader(X, z, weights,
                     batch_size, shuffle, num_workers=2):
     """
-    Build a PyTorch DataLoader with a 6-tensor TensorDataset.
+    Build a PyTorch DataLoader with a 3-tensor TensorDataset.
 
-    Each batch yields: (x_b, mags_b, errs_b, mask_b, z_b, zw_b).
+    Each batch yields: (x_b, z_b, zw_b).
 
     Parameters
     ----------
-    X, mags, errs, mask, z : numpy float32 arrays from build_features
+    X, z : numpy float32 arrays from build_features
     weights    : (N,) float32  per-sample loss weights (e.g. compute_z_weights)
     batch_size : int
     shuffle    : bool
@@ -488,9 +573,6 @@ def make_dataloader(X, mags, errs, mask, z, weights,
     """
     ds = TensorDataset(
         torch.from_numpy(X),
-        torch.from_numpy(mags),
-        torch.from_numpy(errs),
-        torch.from_numpy(mask),
         torch.from_numpy(z),
         torch.from_numpy(weights),
     )
